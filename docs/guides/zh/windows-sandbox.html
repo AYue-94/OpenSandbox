@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Windows 沙箱 · OpenSandbox 指南（中文）</title>
+  <meta name="description" content="通过 KVM/QEMU 在 Linux 容器中运行 Windows 客户机，并由 OpenSandbox 生命周期 API 管理。" />
+  <link rel="stylesheet" href="guides-zh.css" />
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <a class="brand" href="index.html">OpenSandbox</a>
+      <div class="brand-sub">功能指南 · 中文版</div>
+      <h2>目录</h2>
+      <nav>
+      <a href="index.html">总览</a>
+      <a href="credential-vault.html">凭证保管库</a>
+      <a href="secure-access.html">安全访问</a>
+      <a href="secure-container.html">安全容器运行时</a>
+      <a href="multi-tenancy.html">多租户</a>
+      <a href="isolation-sessions.html">隔离会话</a>
+      <a href="pause-resume.html">暂停与恢复</a>
+      <a href="qemu-vmstate-snapshots.html">QEMU VMState 快照</a>
+      <a href="egress-sse-truncation.html">Egress SSE 截断</a>
+      <a href="lifecycle-hooks.html">生命周期钩子</a>
+      <a href="windows-sandbox.html" class="active">Windows 沙箱</a>
+      <a href="client-pool.html">客户端 Pool</a>
+      <a href="component-telemetry.html">组件遥测</a>
+      </nav>
+      <p class="note" style="margin-top:1.5rem">由英文 docs/guides/*.md 翻译的静态 HTML，便于本地阅读。</p>
+    </aside>
+    <main class="content">
+      <header class="page-head">
+        <h1>Windows 沙箱</h1>
+        <p class="desc">通过 KVM/QEMU 在 Linux 容器中运行 Windows 客户机，并由 OpenSandbox 生命周期 API 管理。</p>
+      </header>
+
+      <p>Windows 沙箱通过 KVM/QEMU 在 Linux 容器中运行 Windows 客户机，并由 OpenSandbox 生命周期 API（创建、暴露端点、删除）端到端管理。当前 Windows 配置文件基于 <a href="https://github.com/dockur/windows"><code>dockur/windows</code></a>，由 OpenSandbox 提供服务集成与能力。</p>
+
+      <h2 id="scope">范围</h2>
+      <p>本指南覆盖 OpenSandbox Server 的 Windows 配置文件（<code>platform.os=windows</code>）：</p>
+      <ul>
+        <li>创建 Windows 沙箱</li>
+        <li>查看状态与端点</li>
+        <li>常见资源与卷设置</li>
+        <li>删除与清理</li>
+      </ul>
+
+      <h2 id="how-it-works">工作原理</h2>
+      <ul>
+        <li><strong>运行时</strong>：<a href="https://github.com/dockur/windows"><code>dockur/windows</code></a> 在 Linux 容器中运行 Windows 客户机（需要 KVM/QEMU），使用 <code>/storage</code>、<code>/boot.iso</code> 等挂载点存放系统盘与安装介质。</li>
+        <li><strong>控制面</strong>：创建时，OpenSandbox Server 注入 Windows 配置文件（设备、capabilities、<code>execd</code>、端口映射），并执行资源检查、状态管理与端点发布。</li>
+        <li><strong>客户端</strong>：通过生命周期 API 或 Python SDK，指定 <code>platform.os=windows</code>，然后按 创建 → 轮询 <code>Running</code> → 获取端点 → 使用 → 删除 的流程操作。</li>
+      </ul>
+
+      <h2 id="prerequisites">前置条件</h2>
+      <ul>
+        <li>可访问的 OpenSandbox Server（例如 <code>http://localhost:8080</code>）</li>
+        <li>主机满足 Windows 配置文件要求：
+          <ul>
+            <li>存在 <code>/dev/kvm</code></li>
+            <li>存在 <code>/dev/net/tun</code></li>
+          </ul>
+        </li>
+        <li>服务器已配置 <code>storage.allowed_host_paths</code>，以允许主机路径</li>
+        <li>建议准备一个绑定到 <code>/storage</code> 的主机目录</li>
+        <li>可选：本地 Windows ISO 用于 <code>/boot.iso</code>（可减少重复下载时间）</li>
+      </ul>
+
+      <h2 id="key-settings-and-constraints">关键设置与约束</h2>
+
+      <h3 id="platform-and-image">平台与镜像</h3>
+      <ul>
+        <li>设置 <code>platform: {"os":"windows","arch":"amd64"}</code>（<code>arm64</code> 取决于主机）</li>
+        <li>建议镜像：<code>dockurr/windows:latest</code>；参见 <a href="https://github.com/dockur/windows/releases"><code>dockur/windows</code> releases</a> 与 <a href="https://hub.docker.com/r/dockurr/windows/tags">Docker Hub tags</a></li>
+      </ul>
+
+      <h3 id="minimum-resources">最低资源</h3>
+      <p>Windows 配置文件强制要求：</p>
+      <ul>
+        <li><code>resourceLimits.cpu &gt;= 2</code></li>
+        <li><code>resourceLimits.memory &gt;= 4G</code></li>
+        <li><code>resourceLimits.disk &gt;= 64G</code></li>
+      </ul>
+
+      <h3 id="resourcelimits-vs-environment-variables"><code>resourceLimits</code> 与环境变量</h3>
+      <p>若设置了 <code>resourceLimits</code>，服务器会将其映射并覆盖下列环境变量：</p>
+      <ul>
+        <li><code>CPU_CORES</code></li>
+        <li><code>RAM_SIZE</code></li>
+        <li><code>DISK_SIZE</code></li>
+      </ul>
+      <p>请只使用 <code>resourceLimits</code>；不要手动设置这三个环境变量。</p>
+
+      <h3 id="default-ports-and-user_ports">默认端口与 <code>USER_PORTS</code></h3>
+      <p>Windows 配置文件默认接通这些端口：</p>
+      <ul>
+        <li><code>44772</code>（execd）</li>
+        <li><code>8080</code></li>
+        <li><code>3389/tcp</code>、<code>3389/udp</code>（RDP）</li>
+        <li><code>8006/tcp</code>（典型 Web 控制台）</li>
+      </ul>
+      <p>同时会构建或合并 <code>USER_PORTS</code>（通常为 <code>44772,8080,3389,8006</code>）。</p>
+
+      <h3 id="storage-mounts">存储挂载</h3>
+      <ul>
+        <li>将可写主机目录绑定到 <code>/storage</code></li>
+        <li>可选：将 ISO 文件以 <code>readOnly=true</code> 绑定到 <code>/boot.iso</code></li>
+        <li>主机路径必须落在 <code>storage.allowed_host_paths</code> 之下，否则请求会被拒绝</li>
+      </ul>
+
+      <h2 id="end-to-end-example-python">端到端示例（Python）</h2>
+      <p>该流程：</p>
+      <ol>
+        <li>创建 Windows 沙箱</li>
+        <li>等待进入 <code>Running</code></li>
+        <li>获取 <code>44772</code> 端点</li>
+        <li>用 Python SDK 操作沙箱</li>
+        <li>删除沙箱</li>
+      </ol>
+
+      <h3 id="minimal-example">最小示例</h3>
+      <pre><code class="language-python">import os
+from datetime import timedelta
+
+from opensandbox import SandboxSync
+from opensandbox.config import ConnectionConfigSync
+from opensandbox.models.sandboxes import PlatformSpec
+
+BASE_URL = os.getenv("OPEN_SANDBOX_BASE_URL", "http://localhost:8080")
+API_KEY = os.getenv("OPEN_SANDBOX_API_KEY", "")
+
+
+def main() -&gt; None:
+    cfg = ConnectionConfigSync(
+        domain=BASE_URL,
+        api_key=API_KEY or None,
+        use_server_proxy=True,
+    )
+
+    sbx = None
+    try:
+        sbx = SandboxSync.create(
+            image="dockurr/windows:latest",
+            timeout=timedelta(hours=12),
+            ready_timeout=timedelta(minutes=30),
+            resource={
+                "cpu": "4",
+                "memory": "8G",
+                "disk": "64G",
+            },
+            env={"VERSION": "11"},
+            entrypoint=["cmd", "/c", "echo OpenSandbox Windows profile"],
+            platform=PlatformSpec(os="windows", arch="amd64"),
+            connection_config=cfg,
+        )
+        print("created:", sbx.id)
+
+        endpoint = sbx.get_endpoint(44772)
+        print("execd endpoint:", endpoint.endpoint)
+        print("sdk health:", sbx.is_healthy())
+    finally:
+        if sbx is not None:
+            try:
+                sbx.kill()
+                print("deleted:", sbx.id)
+            finally:
+                sbx.close()
+
+
+if __name__ == "__main__":
+    main()
+</code></pre>
+      <blockquote>
+        <p>示例会等待 SDK 健康检查（<code>ready_timeout=30m</code>）。Windows 冷启动可能较慢；请按需增大 <code>ready_timeout</code>。若需自定义就绪逻辑，可使用 <code>skip_health_check=True</code>，并在应用中自行轮询 <code>Running</code>。</p>
+      </blockquote>
+
+      <h3 id="advanced-options">进阶选项</h3>
+
+      <h4 id="persistent-storage">持久化 <code>/storage</code></h4>
+      <p>将主机路径绑定到 <code>/storage</code>，作为持久的系统/用户数据目录。该目录<strong>不必事先存在</strong>：绑定挂载时可能会新建（全新），若已存在则会复用。<code>host.path</code> 无论目录是否存在，都必须位于允许的 <code>storage.allowed_host_paths</code> 前缀下。</p>
+      <pre><code class="language-python">from opensandbox.models.sandboxes import Host, Volume
+
+volumes = [
+    Volume(
+        name="win-storage",
+        host=Host(path="/data/opensandbox/windows-storage"),
+        mount_path="/storage",
+        read_only=False,
+    ),
+]
+# Pass as SandboxSync.create(..., volumes=volumes, ...)
+</code></pre>
+
+      <h4 id="existing-iso-on-the-host">主机上已有 ISO</h4>
+      <p>将本地 Windows 安装 ISO 以只读方式绑定到 <code>/boot.iso</code>，可避免每次下载介质（同样需要 <code>allowed_host_paths</code>；路径必须是<strong>文件</strong>）：</p>
+      <pre><code class="language-python">from opensandbox.models.sandboxes import Host, Volume
+
+volumes = [
+    Volume(
+        name="win-iso",
+        host=Host(path="/data/iso/Win11_23H2.iso"),
+        mount_path="/boot.iso",
+        read_only=True,
+    ),
+]
+</code></pre>
+
+      <h4 id="customizing-dockur-windows">自定义 <code>dockur/windows</code></h4>
+      <p><a href="https://github.com/dockur/windows"><code>dockur/windows</code></a> 通过<strong>环境变量</strong>配置。OpenSandbox 会按上游文档将你的 <code>env</code> 传入容器。<strong>安装 / UX</strong> 相关设置常见包括：</p>
+      <ul>
+        <li><code>VERSION</code>：Windows 变体代码（例如 <code>11</code>、<code>11l</code>、<code>10</code>——完整表见项目 README），某些情况下也可以是自定义 ISO 的 <code>https://</code> URL</li>
+        <li><code>USERNAME</code> / <code>PASSWORD</code>：首个用户与密码（省略时使用镜像默认值——见上游）</li>
+        <li><code>LANGUAGE</code>：安装语言（例如 <code>English</code>、<code>Chinese</code>）</li>
+        <li><code>REGION</code> / <code>KEYBOARD</code>：区域与键盘布局（例如 <code>en-US</code>、<code>zh-CN</code>）</li>
+        <li>进阶场景可能用到 <code>DHCP</code>、<code>ARGUMENTS</code>（额外 QEMU 参数）等——见 <a href="https://github.com/dockur/windows"><code>dockur/windows</code> FAQ</a></li>
+      </ul>
+      <p>若已通过 <code>resourceLimits</code> 设置 CPU、内存与磁盘，请<strong>不要</strong>再在 <code>env</code> 中重复 dockur 文档里的同类<strong>资源</strong>键；参见上文 <a href="#resourcelimits-vs-environment-variables"><code>resourceLimits</code> 与环境变量</a>。其他非资源键可自由组合。</p>
+      <pre><code class="language-python">env = {
+    "VERSION": "11l",
+    "USERNAME": "Docker",
+    "PASSWORD": "your-secure-password",
+    "LANGUAGE": "Chinese",
+    "REGION": "zh-CN",
+    "KEYBOARD": "zh-CN",
+}
+</code></pre>
+      <p>完整列表、默认值与交互说明，请参阅 <a href="https://github.com/dockur/windows"><code>dockur/windows</code> 仓库</a> 与镜像标签。</p>
+
+      <h4 id="using-your-own-windows-image">使用自有 Windows 镜像</h4>
+      <p>在 <a href="https://github.com/dockur/windows"><code>dockur/windows</code> 文档</a>中，<strong>“your own”</strong> 通常指<strong>使用哪一份 Windows 安装 ISO</strong>——而不是与上游无关的自定义配方。<a href="https://github.com/dockur/windows#how-do-i-install-a-custom-image">自定义安装 FAQ</a> 写明：</p>
+      <ul>
+        <li>对于项目版本表中<strong>没有</strong>的 ISO，将 <code>VERSION</code> 设为该 ISO 的<strong>下载 URL</strong>（<code>https://...</code>）；容器会拉取并安装。</li>
+        <li>若你<strong>已有本地 ISO 文件</strong>，按上文 <a href="#existing-iso-on-the-host">主机上已有 ISO</a> 将其绑定到 <strong><code>/boot.iso</code></strong>；上游文档说明此时会忽略 <code>VERSION</code>。</li>
+      </ul>
+      <p>在 OpenSandbox 中，在 <code>env</code> 里设置 <code>VERSION</code>，需要时再为本地 ISO 添加挂载到 <code>/boot.iso</code> 的卷，与上游流程一致；<code>image</code> 保持为 <code>dockurr/windows</code> 或其他兼容上游镜像，与其他示例相同。</p>
+      <p><strong><code>VERSION</code> = ISO URL</strong> 场景片段（与最小示例传入 <code>env</code> 的方式相同）：</p>
+      <pre><code class="language-python">env = {
+    "VERSION": "https://example.com/path/to/your.iso",
+    # same pattern as the minimal example for resource / platform / etc.
+}
+</code></pre>
+
+      <h2 id="faq">常见问题</h2>
+      <ul>
+        <li>创建时报 <code>Unsupported platform.os 'windows'</code> — 服务器构建未包含 Windows 配置文件；请升级到包含该能力的版本。</li>
+        <li><code>resourceLimits.*</code> 出现 <code>INVALID_PARAMETER</code> — 确保 <code>cpu &gt;= 2</code>、<code>memory &gt;= 4G</code>、<code>disk &gt;= 64G</code>。</li>
+        <li>长时间停留在 <code>Pending</code> — 首次 Windows 安装较慢；检查主机资源与 <code>/storage</code> 空间，并增大等待超时。</li>
+        <li>状态为 <code>Running</code> 但端点不可达 — 确认 <code>GET /v1/sandboxes/{id}/endpoints/44772</code> 返回有效地址；若需转发更多端口，请设置 <code>env.USER_PORTS</code>。</li>
+      </ul>
+
+    </main>
+  </div>
+</body>
+</html>

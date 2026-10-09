@@ -1,0 +1,511 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>暂停与恢复 · OpenSandbox 指南（中文）</title>
+  <meta name="description" content="将沙箱状态暂停为 OCI 镜像，并在 Kubernetes 上从快照恢复。" />
+  <link rel="stylesheet" href="guides-zh.css" />
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <a class="brand" href="index.html">OpenSandbox</a>
+      <div class="brand-sub">功能指南 · 中文版</div>
+      <h2>目录</h2>
+      <nav>
+      <a href="index.html">总览</a>
+      <a href="credential-vault.html">凭证保管库</a>
+      <a href="secure-access.html">安全访问</a>
+      <a href="secure-container.html">安全容器运行时</a>
+      <a href="multi-tenancy.html">多租户</a>
+      <a href="isolation-sessions.html">隔离会话</a>
+      <a href="pause-resume.html" class="active">暂停与恢复</a>
+      <a href="qemu-vmstate-snapshots.html">QEMU VMState 快照</a>
+      <a href="egress-sse-truncation.html">Egress SSE 截断</a>
+      <a href="lifecycle-hooks.html">生命周期钩子</a>
+      <a href="windows-sandbox.html">Windows 沙箱</a>
+      <a href="client-pool.html">客户端 Pool</a>
+      <a href="component-telemetry.html">组件遥测</a>
+      </nav>
+      <p class="note" style="margin-top:1.5rem">由英文 docs/guides/*.md 翻译的静态 HTML，便于本地阅读。</p>
+    </aside>
+    <main class="content">
+      <header class="page-head">
+        <h1>暂停与恢复</h1>
+        <p class="desc">将沙箱状态暂停为 OCI 镜像，并在 Kubernetes 上从快照恢复。</p>
+      </header>
+
+      <nav class="toc">
+        <strong>目录</strong>
+        <ol>
+          <li><a href="#overview">概述</a></li>
+          <li><a href="#architecture">架构</a></li>
+          <li><a href="#prerequisites">前置条件</a></li>
+          <li><a href="#controller-configuration">控制器配置</a></li>
+          <li><a href="#registry-and-secret-setup">Registry 与 Secret 设置</a></li>
+          <li><a href="#usage-guide">使用指南</a></li>
+          <li><a href="#administrator-guide">管理员指南</a></li>
+          <li><a href="#sandboxsnapshot-reference">SandboxSnapshot 参考</a></li>
+          <li><a href="#troubleshooting">故障排查</a></li>
+        </ol>
+      </nav>
+
+      <hr />
+
+      <h2 id="overview">概述</h2>
+      <p>本指南说明如何在 OpenSandbox 中对 Kubernetes 后端沙箱使用暂停与恢复功能。暂停会将沙箱的根文件系统提交为 OCI 镜像并释放集群资源。恢复则从该镜像还原沙箱。</p>
+
+      <h3 id="what-pause-and-resume-does">暂停与恢复做什么</h3>
+      <table>
+        <thead>
+          <tr><th></th><th>行为</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Pause</strong></td>
+            <td>创建内部 <code>SandboxSnapshot</code>，将运行中容器的根文件系统提交为 OCI 镜像，然后静默沙箱运行时并释放 Pods / 池化分配</td>
+          </tr>
+          <tr>
+            <td><strong>Resume</strong></td>
+            <td>复用同一个 <code>BatchSandbox</code>，将其模板改写为最新的快照镜像，并从该镜像重建运行时</td>
+          </tr>
+          <tr>
+            <td><strong>sandboxId</strong></td>
+            <td>在 pause/resume 周期中保持稳定 — 调用方在整个沙箱生命周期内使用同一 ID</td>
+          </tr>
+          <tr>
+            <td><strong>副本支持</strong></td>
+            <td>当前仅限 <code>BatchSandbox.spec.replicas=1</code>。服务端创建的 Kubernetes 沙箱使用 <code>replicas: 1</code>；带有其它副本数的直接 CR 会被控制器的暂停入口拒绝。</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3 id="key-design-principle">关键设计原则</h3>
+      <p><strong>控制器级配置</strong>：Registry URL 与推送/拉取 Secret 配置在 Kubernetes controller manager 上，而不是 <code>~/.sandbox.toml</code>。SDK 用户与 API 调用方<strong>无需修改代码</strong>即可使用 pause/resume — 只需对已有沙箱 ID 调用 <code>pause</code> 与 <code>resume</code>。</p>
+
+      <h3 id="lifecycle">生命周期</h3>
+      <pre><code class="language-text">Time ----------------------------------------------------------------&gt;
+
+Sandbox lifecycle:   [Running]--[Pausing]--[Paused]--[Resuming]--[Running]
+                         |                     |
+                  commit rootfs          rewrite template images
+                  push to registry       recreate runtime from snapshot
+                  release pods/alloc</code></pre>
+
+      <h3 id="state-machine-details">状态机细节</h3>
+      <p>沙箱会经历稳定状态与中间状态：</p>
+      <table>
+        <thead>
+          <tr><th>状态</th><th>类型</th><th>说明</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>Running</code></td><td>稳定</td><td>沙箱处于活动状态并处理请求</td></tr>
+          <tr><td><code>Pausing</code></td><td>中间</td><td>暂停操作进行中。快照提交通过内部 <code>SandboxSnapshot</code> 资源协调。</td></tr>
+          <tr><td><code>Paused</code></td><td>稳定</td><td>沙箱已暂停，最新 rootfs 快照就绪，运行时 Pods / 池化分配已释放</td></tr>
+          <tr><td><code>Resuming</code></td><td>中间</td><td>恢复操作进行中。控制器正将沙箱模板改写为最新快照镜像并重建运行时</td></tr>
+          <tr><td><code>Failed</code></td><td>稳定</td><td>操作失败（检查 <code>reason</code> 与 <code>message</code> 了解详情）</td></tr>
+        </tbody>
+      </table>
+      <p>Lifecycle API 仅暴露上述粗粒度沙箱状态。要查看详细快照进度，请检查内部 <code>SandboxSnapshot</code> 资源：</p>
+      <p>控制器报告 <code>Paused</code> 之后，Pod 终止仍可能继续。可在此区间提交恢复请求；控制器会等待旧 Pod 被移除后再创建替换 Pod。带有 deletion timestamp 的 Pod 不会贡献新的运行时失败条件，包括 Kubernetes 在删除期间报告的终端退出状态。已记录在沙箱上的失败仍保持终端态，替换 Pod 的失败仍会正常报告。</p>
+      <ul>
+        <li><code>Pending</code>：快照请求已接受，等待解析源 Pod / 创建 commit Job</li>
+        <li><code>Committing</code>：commit Job 正在运行并推送快照镜像</li>
+        <li><code>Succeed</code>：快照就绪，可用于下一次恢复</li>
+        <li><code>Failed</code>：快照创建失败</li>
+      </ul>
+
+      <h3 id="what-is-preserved">保留了什么</h3>
+      <table>
+        <thead>
+          <tr><th></th><th>是否保留？</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>根文件系统内容</td><td>✅ 是 — 提交为 OCI 镜像</td></tr>
+          <tr><td>环境变量</td><td>✅ 是 — 来自 BatchSandbox 模板</td></tr>
+          <tr><td>运行中的进程 / 内存</td><td>Rootfs 模式：否。可选的 QEMU-in-runc 模式：QEMU 进程与 Guest 内存会恢复；其它外层进程会重启。参见 <a href="qemu-vmstate-snapshots.html">QEMU VMState 快照</a>。</td></tr>
+          <tr><td>显式卷挂载</td><td>取决于卷类型</td></tr>
+          <tr><td>凭证保管库条目</td><td>否 — 仅存储在 egress sidecar 内存中；恢复后需从可信控制面重新注入</td></tr>
+        </tbody>
+      </table>
+      <p>Pause/resume 当前仅支持单副本。内部暂停快照只记录一个源 Pod 的容器镜像，不存储每副本状态，因此除非 <code>BatchSandbox.spec.replicas=1</code>，Kubernetes 控制器会拒绝暂停请求。</p>
+      <p>参见 <a href="credential-vault.html#persistence-across-pause-and-resume">凭证保管库</a> 了解恢复后所需的凭证重新注入流程。</p>
+
+      <hr />
+
+      <h2 id="architecture">架构</h2>
+      <pre><code>API caller
+    │ POST /v1/sandboxes/{id}/pause
+    ▼
+OpenSandbox Server
+    │ PATCH BatchSandbox.spec.pause=true
+    ▼
+BatchSandbox Controller (Kubernetes)
+    │ validates lifecycle state
+    │ creates internal SandboxSnapshot CR
+    ▼
+SandboxSnapshot Controller
+    │ resolves running Pod
+    │ creates commit Job on the same node
+    ▼
+commit Job Pod (image-committer)
+    │ containerd API: commit container rootfs → OCI image
+    │ OCI registry resolver: push image
+    ▼
+SandboxSnapshot.status.phase = Succeed
+    │ BatchSandbox.status.phase = Paused
+    │ deletes Pods or releases pooled allocation
+    ▼
+Cluster resources released
+
+--- Later: resume ---
+
+API caller
+    │ POST /v1/sandboxes/{id}/resume
+    ▼
+OpenSandbox Server
+    │ PATCH BatchSandbox.spec.pause=false
+    ▼
+BatchSandbox Controller
+    │ reads internal SandboxSnapshot
+    │ rewrites pod template images from snapshot
+    │ clears poolRef for pooled sandboxes
+    │ recreates runtime Pods
+    ▼
+Sandbox running again with restored filesystem</code></pre>
+
+      <hr />
+
+      <h2 id="prerequisites">前置条件</h2>
+      <ol>
+        <li>已部署 OpenSandbox 控制器的 <strong>Kubernetes 集群</strong></li>
+        <li>集群节点（推送）与 Kubernetes API（拉取）均可访问的 <strong>OCI 兼容容器 registry</strong></li>
+        <li>用于 registry 认证的类型为 <code>kubernetes.io/dockerconfigjson</code> 的 <strong>Kubernetes Secrets</strong></li>
+        <li>已用快照 registry 与 secret flags 配置的 <strong>controller manager</strong></li>
+      </ol>
+
+      <hr />
+
+      <h2 id="controller-configuration">控制器配置</h2>
+      <p>使用快照相关 flags 配置 controller manager 部署：</p>
+      <pre><code class="language-yaml">- --snapshot-registry=registry.example.com/sandboxes
+- --snapshot-registry-insecure=false
+- --snapshot-push-secret=registry-snapshot-push-secret
+- --resume-pull-secret=registry-pull-secret</code></pre>
+
+      <h3 id="configuration-reference">配置参考</h3>
+      <table>
+        <thead>
+          <tr><th>键</th><th>类型</th><th>默认值</th><th>说明</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>--snapshot-registry</code></td><td>string</td><td><code>""</code></td><td><strong>必需。</strong>OCI registry 前缀。镜像存储为 <code>&lt;registry&gt;/&lt;sandboxName&gt;-&lt;container&gt;:snap-gen&lt;N&gt;</code>。</td></tr>
+          <tr><td><code>--snapshot-registry-insecure</code></td><td>bool</td><td><code>false</code></td><td>为快照推送启用不安全 registry 模式。仅用于 HTTP 或自签名的本地 registry。</td></tr>
+          <tr><td><code>--snapshot-push-secret</code></td><td>string</td><td><code>""</code></td><td>用于推送快照的 Kubernetes Secret 名称。必须是 <code>kubernetes.io/dockerconfigjson</code> 类型。</td></tr>
+          <tr><td><code>--image-committer-pod-template-file</code></td><td>string</td><td><code>""</code></td><td>commit Job Pod 的 PodTemplateSpec 覆盖文件路径。</td></tr>
+          <tr><td><code>--resume-pull-secret</code></td><td>string</td><td><code>""</code></td><td>注入到恢复后沙箱、用于拉取快照镜像的 Kubernetes Secret 名称。可与推送 Secret 相同。</td></tr>
+          <tr><td><code>--image-committer-image</code></td><td>string</td><td><code>"image-committer:dev"</code></td><td>commit Jobs 使用的镜像。</td></tr>
+          <tr><td><code>--commit-job-timeout</code></td><td>duration</td><td><code>"10m"</code></td><td>commit Jobs 的超时时间。</td></tr>
+        </tbody>
+      </table>
+
+      <h3 id="helm-chart-support">Helm chart 支持</h3>
+      <p><code>opensandbox-controller</code> Helm chart 现已直接暴露与快照相关的控制器值：</p>
+      <ul>
+        <li><code>controller.snapshot.imageCommitterImage</code></li>
+        <li><code>controller.snapshot.imageCommitterPodTemplate</code></li>
+        <li><code>controller.snapshot.commitJobTimeout</code></li>
+        <li><code>controller.snapshot.registry</code></li>
+        <li><code>controller.snapshot.registryInsecure</code></li>
+        <li><code>controller.snapshot.snapshotPushSecret</code></li>
+        <li><code>controller.snapshot.resumePullSecret</code></li>
+      </ul>
+      <p>对于一体化的 <code>opensandbox</code> chart，请在 <code>opensandbox-controller.*</code> 前缀下使用相同的值。</p>
+
+      <h3 id="startup-behavior">启动行为</h3>
+      <p>服务端不再携带专用的 pause/resume 配置。缺少 registry 或 secret 设置时，会在 Kubernetes 控制器处理 <code>SandboxSnapshot</code> 时暴露，例如作为 <code>SandboxSnapshot.status.conditions[type=Failed]</code>，原因为 <code>RegistryNotConfigured</code> 等。</p>
+
+      <hr />
+
+      <h2 id="registry-and-secret-setup">Registry 与 Secret 设置</h2>
+
+      <h3 id="step-1-prepare-your-registry">步骤 1：准备 registry</h3>
+      <p>任何 OCI 兼容的 registry 均可（Docker Hub、GitHub Container Registry、Harbor、私有 <code>registry:2</code> 实例等）。Registry 必须：</p>
+      <ul>
+        <li><strong>可从集群节点到达</strong>（供 commit Job 推送）</li>
+        <li><strong>可从 Kubernetes API server / kubelet 到达</strong>（供恢复时拉镜像）</li>
+      </ul>
+
+      <h3 id="step-2-create-the-push-secret">步骤 2：创建推送 Secret</h3>
+      <pre><code class="language-bash">kubectl create secret docker-registry registry-snapshot-push-secret \
+  --docker-server=registry.example.com \
+  --docker-username=&lt;username&gt; \
+  --docker-password=&lt;password-or-token&gt; \
+  --namespace=&lt;sandbox-namespace&gt;</code></pre>
+
+      <h3 id="step-3-create-the-pull-secret">步骤 3：创建拉取 Secret</h3>
+      <p>拉取 Secret 由恢复后的 <code>BatchSandbox</code> Pod 用于拉取快照镜像。若凭证同时具备读写权限，可与推送 Secret 使用同一个：</p>
+      <pre><code class="language-bash">kubectl create secret docker-registry registry-pull-secret \
+  --docker-server=registry.example.com \
+  --docker-username=&lt;username&gt; \
+  --docker-password=&lt;password-or-token&gt; \
+  --namespace=&lt;sandbox-namespace&gt;</code></pre>
+
+      <h3 id="using-a-private-registry2-development">使用私有 <code>registry:2</code>（开发）</h3>
+      <p>在开发中使用集群内 <code>registry:2</code> 部署时：</p>
+      <pre><code class="language-bash"># Create a registry deployment
+kubectl create deployment docker-registry \
+  --image=registry:2 --port=5000
+
+kubectl expose deployment docker-registry --port=5000
+
+# No authentication needed for internal registry
+# Leave snapshot push/pull secret flags empty on the controller manager</code></pre>
+
+      <hr />
+
+      <h2 id="usage-guide">使用指南</h2>
+      <p>一旦配置好 controller manager 且服务端正在运行，pause/resume 即可通过标准 Lifecycle API 使用。无需修改 SDK。</p>
+
+      <h3 id="pause-a-sandbox">暂停沙箱</h3>
+      <pre><code class="language-bash">curl -X POST http://localhost:8080/v1/sandboxes/{sandbox_id}/pause \
+  -H "Content-Type: application/json"</code></pre>
+      <p><strong>响应：</strong><code>202 Accepted</code>，空正文。</p>
+      <p>暂停是异步的。沙箱会经历：<code>running</code> → <code>pausing</code> → <code>paused</code></p>
+
+      <h3 id="check-pause-status">检查暂停状态</h3>
+      <pre><code class="language-bash">curl http://localhost:8080/v1/sandboxes/{sandbox_id}</code></pre>
+      <p>当 <code>status</code> 为 <code>paused</code> 时，文件系统已提交，集群资源已释放。</p>
+
+      <h3 id="resume-a-sandbox">恢复沙箱</h3>
+      <pre><code class="language-bash">curl -X POST http://localhost:8080/v1/sandboxes/{sandbox_id}/resume \
+  -H "Content-Type: application/json"</code></pre>
+      <p><strong>响应：</strong><code>202 Accepted</code>，空正文。</p>
+      <p>沙箱会经历：<code>paused</code> → <code>resuming</code> → <code>running</code></p>
+
+      <h3 id="multiple-pauseresume-cycles">多次 pause/resume 周期</h3>
+      <p>Pause 与 resume 可以重复。每次暂停周期会生成新的快照镜像标签（<code>snap-gen1</code>、<code>snap-gen2</code>，…）。下一次恢复始终使用最新快照。</p>
+
+      <hr />
+
+      <h2 id="administrator-guide">管理员指南</h2>
+
+      <h3 id="controller-rbac">控制器 RBAC</h3>
+      <p>OpenSandbox 控制器为 pause/resume 需要以下 RBAC 权限（已包含在 Helm chart 与 <code>make manifests</code> 输出中）：</p>
+      <table>
+        <thead>
+          <tr><th>资源</th><th>Verbs</th><th>用途</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>sandboxsnapshots</code></td><td>get, list, watch, create, update, patch, delete</td><td>管理 SandboxSnapshot CR</td></tr>
+          <tr><td><code>jobs</code> / <code>jobs/status</code></td><td>full</td><td>创建/监控 commit Jobs</td></tr>
+          <tr><td><code>secrets</code></td><td>get</td><td>在创建 commit Job 前验证推送 Secret 存在</td></tr>
+          <tr><td><code>pods</code></td><td>get, list, watch</td><td>查找用于 commit 的运行中 Pod</td></tr>
+        </tbody>
+      </table>
+
+      <h3 id="snapshot-image-naming">快照镜像命名</h3>
+      <p>内部 pause/resume 快照镜像命名为：</p>
+      <pre><code>&lt;snapshot-registry&gt;/&lt;sandboxName&gt;-&lt;containerName&gt;:snap-gen&lt;N&gt;</code></pre>
+      <p>例如，使用 <code>--snapshot-registry=registry.example.com/sandboxes</code>、沙箱 <code>my-sandbox</code>、容器 <code>sandbox</code>、首次暂停：</p>
+      <pre><code>registry.example.com/sandboxes/my-sandbox-sandbox:snap-gen1</code></pre>
+      <p>服务端管理的公共快照使用相同的仓库布局，但标签由稳定的 snapshot-id 派生：</p>
+      <pre><code>&lt;snapshot-registry&gt;/&lt;sandboxName&gt;-&lt;containerName&gt;:snap-&lt;snapshotIdHex&gt;</code></pre>
+      <p>控制器通过 owner reference 区分两种模式。Pause/resume 快照由 <code>BatchSandbox</code> 控制器创建，并带有指向所属 <code>BatchSandbox</code> 的 controller ownerReference；公共快照由 Lifecycle 服务端创建，不使用该 ownerReference。</p>
+
+      <h3 id="runtime-compatibility">运行时兼容性</h3>
+      <p>内置的 <code>rootfs-v1</code> image committer 需要暴露兼容的 containerd task pause/resume 与可写快照 API 的容器运行时。handler 为 <code>runsc</code> 的 gVisor RuntimeClasses 目前不满足该契约。Lifecycle 服务端会在持久化快照记录或创建 <code>SandboxSnapshot</code> 资源之前拒绝这些工作负载的公共快照创建，使运行中的沙箱保持不变。</p>
+      <p>原生 gVisor checkpoint/restore 需要专用的快照后端，并非由 <code>rootfs-v1</code> committer 提供。</p>
+
+      <h3 id="commit-job">Commit Job</h3>
+      <p>控制器为每次暂停创建一个短生命周期的 Kubernetes <code>Job</code>：</p>
+      <ul>
+        <li><strong>Job 名称</strong>：<code>&lt;snapshotName&gt;-commit</code></li>
+        <li><strong>节点亲和性</strong>：运行在与源 Pod <strong>相同的节点</strong>上（需要访问 containerd socket）</li>
+        <li><strong>超时</strong>：10 分钟（<code>ActiveDeadlineSeconds</code>）</li>
+        <li><strong>TTL</strong>：完成后 5 分钟（<code>TTLSecondsAfterFinished</code>）</li>
+        <li><strong>镜像</strong>：<code>image-committer</code>（可通过控制器 <code>--image-committer-image</code> flag 配置）</li>
+      </ul>
+      <p>Commit Job 挂载来自源节点的主机 containerd socket，并以 UID 0 运行。这使 <code>image-committer</code> 镜像获得节点级容器运行时访问权限。请仅使用受信任的镜像，最好按 digest 固定，或由准入策略控制。</p>
+      <p>内置 image committer 直接使用 containerd API 进行容器查找、task pause/unpause、可写快照镜像创建以及 registry 推送。提交前，它会验证节点的 content store 是否包含该节点平台的每个基础镜像 blob，并从原始镜像 digest 拉取缺失的 blob；这可避免 CRI 在镜像解包期间丢弃压缩内容后导致快照失败。源 registry 默认使用 HTTPS。若受信任的源 registry 需要跳过 TLS 校验或使用纯 HTTP，请通过 image-committer Pod 模板向 <code>commit</code> 容器注入 <code>SOURCE_IMAGE_REGISTRY_INSECURE=true</code>。可复用的 Go 契约与默认实现见 <a href="https://github.com/opensandbox-group/OpenSandbox/tree/main/kubernetes/pkg/imagecommitter"><code>pkg/imagecommitter</code></a>；提供商专用二进制可提供凭证提供程序并复用标准 CLI 契约。Job 还保留主机 <code>/run/containerd/fifo</code> 挂载，以便兼容实现使用 containerd task exec。内置实现使用的任何准备命令均为尽力而为，不会改变 commit 接口。</p>
+      <p>运维可控的 Pod 模板可添加标签、注解、ServiceAccount、调度设置、init containers、sidecars，以及在必需的 <code>commit</code> 容器上设置资源、<code>env</code>、<code>envFrom</code> 等。模板是合并基础，控制器生成的不变量会覆盖冲突的模板值。控制器保留源 <code>nodeName</code>、重启策略、committer 镜像、镜像拉取策略、命令、参数、安全上下文、终止消息设置，以及必需的环境变量、挂载与卷。环境变量、挂载与卷按名称合并，冲突时必需的控制器值优先。额外的常规 sidecar 必须终止，Job 才能完成。</p>
+      <p>模板引用的任何 ServiceAccount 或准入配置必须存在于每个沙箱命名空间中。Unpause Jobs 不会收到 commit Pod 模板，因为它们不访问 registry。</p>
+      <p>若 commit Job 失败，控制器会在同一节点上创建尽力而为的 <code>&lt;snapshotName&gt;-unpause</code> Job，以解除可能因 committer 突然退出而保持暂停状态的源容器。</p>
+      <p>删除 <code>SandboxSnapshot</code> 会清理 Kubernetes 的 commit/unpause Jobs，但不会从 registry 删除已推送的 OCI 镜像。重复的暂停周期会创建如 <code>snap-gen&lt;N&gt;</code> 的标签；请在外部配置 registry 保留或垃圾回收策略。</p>
+
+      <h3 id="monitoring">监控</h3>
+      <p>检查 SandboxSnapshot 状态：</p>
+      <pre><code class="language-bash">kubectl get sandboxsnapshot -n &lt;namespace&gt;
+# NAME          PHASE       SANDBOX_ID     AGE
+# my-snapshot   Succeed     my-sandbox     5m
+
+kubectl describe sandboxsnapshot my-snapshot -n &lt;namespace&gt;</code></pre>
+      <p>需要关注的关键字段：</p>
+      <ul>
+        <li><code>status.phase</code>：<code>Pending</code> → <code>Committing</code> → <code>Succeed</code> / <code>Failed</code></li>
+        <li><code>status.conditions</code>：带有可读消息的就绪或失败原因</li>
+        <li><code>status.containers</code>：每个已提交容器的镜像 URI</li>
+        <li><code>status.sourcePodName</code> / <code>status.sourceNodeName</code>：解析出的快照执行源</li>
+      </ul>
+
+      <h4 id="monitoring-sandbox-state-transitions">监控沙箱状态转换</h4>
+      <p>通过 Lifecycle API 检查沙箱状态时，你会看到中间状态：</p>
+      <p><strong>暂停流程：</strong></p>
+      <pre><code class="language-bash">curl http://localhost:8080/v1/sandboxes/{sandbox_id}
+# Response during pause:
+{
+  "id": "my-sandbox",
+  "status": {
+    "state": "Pausing",
+    "reason": "PAUSING",
+    "message": "Pausing sandbox"
+  }
+}</code></pre>
+      <p><strong>恢复流程：</strong></p>
+      <pre><code class="language-bash">curl http://localhost:8080/v1/sandboxes/{sandbox_id}
+# Response during resume:
+{
+  "id": "my-sandbox",
+  "status": {
+    "state": "Resuming",
+    "reason": "RESUMING",
+    "message": "Resuming sandbox"
+  }
+}</code></pre>
+
+      <hr />
+
+      <h2 id="sandboxsnapshot-reference">SandboxSnapshot 参考</h2>
+
+      <h3 id="spec-fields">Spec 字段</h3>
+      <table>
+        <thead>
+          <tr><th>字段</th><th>类型</th><th>说明</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>sandboxName</code></td><td>string</td><td>同一命名空间中的目标 <code>BatchSandbox</code> 名称</td></tr>
+        </tbody>
+      </table>
+
+      <h3 id="status-fields-set-by-controller">Status 字段（由控制器设置）</h3>
+      <table>
+        <thead>
+          <tr><th>字段</th><th>类型</th><th>说明</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>phase</code></td><td>string</td><td><code>Pending</code> / <code>Committing</code> / <code>Succeed</code> / <code>Failed</code></td></tr>
+          <tr><td><code>conditions</code></td><td>list</td><td>带有 reason 与 message 的 <code>Ready</code> / <code>Failed</code> 条件</td></tr>
+          <tr><td><code>sourcePodName</code></td><td>string</td><td>用于 commit 的 Pod 名称</td></tr>
+          <tr><td><code>sourceNodeName</code></td><td>string</td><td>commit Job 运行的节点</td></tr>
+          <tr><td><code>containers</code></td><td>list</td><td>每个容器的 <code>{containerName, imageUri, imageDigest}</code>。<code>imageDigest</code> 是镜像配置 digest，保留早期 image-committer 版本的镜像 ID 语义。</td></tr>
+          <tr><td><code>observedGeneration</code></td><td>int</td><td>最后处理的 spec generation</td></tr>
+        </tbody>
+      </table>
+
+      <hr />
+
+      <h2 id="troubleshooting">故障排查</h2>
+
+      <h3 id="1-snapshot-stuck-in-failed--push-secret-not-found">1. 快照卡在 <code>Failed</code> — 找不到推送 Secret</h3>
+      <p><strong>原因</strong>：controller manager 配置的 <code>--snapshot-push-secret</code> 在沙箱命名空间中不存在。</p>
+      <p><strong>解决方案</strong>：</p>
+      <pre><code class="language-bash">kubectl get secret registry-snapshot-push-secret -n &lt;namespace&gt;
+# If missing:
+kubectl create secret docker-registry registry-snapshot-push-secret \
+  --docker-server=&lt;registry&gt; \
+  --docker-username=&lt;user&gt; \
+  --docker-password=&lt;token&gt; \
+  -n &lt;namespace&gt;</code></pre>
+      <p>控制器在创建 commit Job <strong>之前</strong>验证 Secret 是否存在（fail-fast）。Secret 创建后，触发新的暂停周期即可。</p>
+
+      <hr />
+
+      <h3 id="2-snapshot-stuck-in-committing-for-a-long-time">2. 快照长时间卡在 <code>Committing</code></h3>
+      <p><strong>检查 commit Job 及其 Pod：</strong></p>
+      <pre><code class="language-bash">kubectl get job -n &lt;namespace&gt; -l sandbox.opensandbox.io/snapshot=&lt;snapshotName&gt;
+kubectl describe pod &lt;commit-pod-name&gt; -n &lt;namespace&gt;</code></pre>
+      <p><strong>常见原因：</strong></p>
+      <table>
+        <thead>
+          <tr><th>症状</th><th>原因</th><th>解决方案</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>ContainerCreating</code> 超过 30s</td><td>Secret 缺失或类型错误</td><td>将 Secret 重建为 <code>kubernetes.io/dockerconfigjson</code></td></tr>
+          <tr><td><code>FailedMount</code> 事件</td><td>找不到 Secret</td><td>见上文问题 #1</td></tr>
+          <tr><td>Pod 在运行但 Job 从不完成</td><td>节点无法到达 registry</td><td>检查节点到 registry 的网络连通性</td></tr>
+          <tr><td>Pod 日志中出现 <code>unauthorized</code></td><td>Secret 中的凭证错误</td><td>用 <code>kubectl get secret ... -o yaml</code> 验证 Secret 内容</td></tr>
+        </tbody>
+      </table>
+
+      <hr />
+
+      <h3 id="3-wrong-secret-type">3. Secret 类型错误</h3>
+      <p>Docker registry Secret <strong>必须</strong>是类型 <code>kubernetes.io/dockerconfigjson</code>。通用 Secret（<code>Opaque</code>）会导致 <code>FailedMount</code> 错误。</p>
+      <pre><code class="language-bash"># Check secret type
+kubectl get secret registry-snapshot-push-secret -o jsonpath='{.type}'
+# Expected: kubernetes.io/dockerconfigjson
+
+# If wrong type, delete and recreate:
+kubectl delete secret registry-snapshot-push-secret
+kubectl create secret docker-registry registry-snapshot-push-secret \
+  --docker-server=&lt;registry&gt; \
+  --docker-username=&lt;user&gt; \
+  --docker-password=&lt;token&gt;</code></pre>
+
+      <hr />
+
+      <h3 id="4-registry-unreachable-committing--failed-after-timeout">4. Registry 不可达（超时后 <code>Committing</code> → <code>Failed</code>）</h3>
+      <p><strong>症状</strong>：Commit Job Pod 启动、运行一段时间后，因推送错误失败。</p>
+      <p><strong>检查：</strong></p>
+      <pre><code class="language-bash"># Inspect commit Pod logs
+kubectl logs &lt;commit-pod-name&gt; -n &lt;namespace&gt;
+
+# Test registry connectivity from a node
+kubectl run registry-test --rm -it --image=alpine -- \
+  wget -O- https://&lt;registry&gt;/v2/ --timeout=5</code></pre>
+      <p><strong>常见原因：</strong></p>
+      <ul>
+        <li>Registry 在防火墙后，集群节点无法访问</li>
+        <li>自签名 TLS 证书未被 containerd 信任</li>
+        <li>Registry URL 错误（http vs https）</li>
+      </ul>
+
+      <hr />
+
+      <h3 id="5-resume-accepted-but-the-runtime-pod-fails-to-start">5. 恢复已接受但运行时 Pod 无法启动</h3>
+      <p><strong>原因</strong>：无法拉取快照镜像。</p>
+      <pre><code class="language-bash">kubectl describe pod &lt;resumed-pod-name&gt; -n &lt;namespace&gt;
+# Look for: ErrImagePull or ImagePullBackOff</code></pre>
+      <p><strong>检查：</strong></p>
+      <ul>
+        <li><code>--resume-pull-secret</code> 配置正确，且 Secret 存在于命名空间中</li>
+        <li>拉取镜像的节点可访问 registry</li>
+        <li>暂停期间快照镜像已成功推送（检查 <code>status.containers</code>）</li>
+      </ul>
+
+      <hr />
+
+      <h3 id="6-sandboxsnapshot-not-being-processed-no-status">6. SandboxSnapshot 未被处理（无 status）</h3>
+      <p><strong>原因</strong>：OpenSandbox 控制器未运行。</p>
+      <pre><code class="language-bash">kubectl get pods -n opensandbox-system
+kubectl logs -n opensandbox-system deployment/opensandbox-controller-manager</code></pre>
+
+      <hr />
+
+      <h2 id="getting-help">获取帮助</h2>
+      <ul>
+        <li><strong>文档</strong>：<a href="https://github.com/opensandbox-group/OpenSandbox">OpenSandbox GitHub</a></li>
+        <li><strong>Issues</strong>：<a href="https://github.com/opensandbox-group/OpenSandbox/issues">GitHub Issues</a></li>
+        <li><strong>Kubernetes 控制器</strong>：<a href="../../architecture/control-plane/operator">Kubernetes 概览</a></li>
+      </ul>
+
+      <div class="footer-nav">
+        <a href="isolation-sessions.html">← 隔离会话</a>
+        <a href="qemu-vmstate-snapshots.html">QEMU VMState 快照 →</a>
+      </div>
+
+    </main>
+  </div>
+</body>
+</html>

@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>组件遥测配置 · OpenSandbox 指南（中文）</title>
+  <meta name="description" content="为 Go 运行时组件配置并禁用 OTLP 指标。" />
+  <link rel="stylesheet" href="guides-zh.css" />
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <a class="brand" href="index.html">OpenSandbox</a>
+      <div class="brand-sub">功能指南 · 中文版</div>
+      <h2>目录</h2>
+      <nav>
+      <a href="index.html">总览</a>
+      <a href="credential-vault.html">凭证保管库</a>
+      <a href="secure-access.html">安全访问</a>
+      <a href="secure-container.html">安全容器运行时</a>
+      <a href="multi-tenancy.html">多租户</a>
+      <a href="isolation-sessions.html">隔离会话</a>
+      <a href="pause-resume.html">暂停与恢复</a>
+      <a href="qemu-vmstate-snapshots.html">QEMU VMState 快照</a>
+      <a href="egress-sse-truncation.html">Egress SSE 截断</a>
+      <a href="lifecycle-hooks.html">生命周期钩子</a>
+      <a href="windows-sandbox.html">Windows 沙箱</a>
+      <a href="client-pool.html">客户端 Pool</a>
+      <a href="component-telemetry.html" class="active">组件遥测</a>
+      </nav>
+      <p class="note" style="margin-top:1.5rem">由英文 docs/guides/*.md 翻译的静态 HTML，便于本地阅读。</p>
+    </aside>
+    <main class="content">
+      <header class="page-head">
+        <h1>组件遥测配置</h1>
+        <p class="desc">为 Go 运行时组件配置并禁用 OTLP 指标。</p>
+      </header>
+
+      <p>Go 组件（包括 execd、egress 与 ingress）共用一个 OTLP metrics exporter。请在<strong>组件进程环境</strong>中设置这些变量。在 lifecycle server 上或沙箱创建请求中设置它们，不会自动配置另一容器（例如 egress sidecar）。关于由 server 管理的 egress 端点，参见 <a href="/architecture/network/egress#observability-opentelemetry">egress 可观测性</a>。</p>
+
+      <h2>导出端点与禁用指标</h2>
+      <p>exporter 使用 HTTP/protobuf，且 <code>OTEL_EXPORTER_OTLP_METRICS_ENDPOINT</code> 优先于 <code>OTEL_EXPORTER_OTLP_ENDPOINT</code>。请使用 collector 的 HTTP receiver（通常为端口 4318）。gRPC 导出，以及通过 <code>OTEL_EXPORTER_OTLP_PROTOCOL</code> 切换传输，均未实现。</p>
+
+      <p>为兼容性，当两个端点均未设置时，execd、egress 与 ingress 也可使用 <code>HOST_IP:4318</code>，或从 <code>/etc/hostinfo</code> 读取的节点 IP。在共享遥测配置中设置了 <code>DisableEndpointFallback</code> 的组件会跳过该回退。因此，仅清空端点变量并不总能禁用指标。</p>
+
+      <p>设置以下任一标准开关即可阻止指标导出，包括显式端点与节点 IP 回退：</p>
+      <pre><code>OTEL_SDK_DISABLED=true
+# Or disable metrics only:
+OTEL_METRICS_EXPORTER=none</code></pre>
+
+      <p>取值不区分大小写。其他取值不会改变现有导出配置；此处 <code>OTEL_METRICS_EXPORTER</code> 也不会选择其他 exporter。这些开关不会禁用原生应用日志，也不会禁用 execd 本地的 <code>/metrics</code> 与 <code>/metrics/watch</code> API。它们还会抑制 egress sidecar 的自动 collector allow 规则，包括在有效策略被重建时。运维人员显式提供的 allow 规则仍然有效。</p>
+
+      <h2>聚合时效性（temporality）</h2>
+      <p>设置 <code>OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE</code> 以选择 exporter 的标准聚合行为：</p>
+      <table>
+        <thead>
+          <tr>
+            <th>取值</th>
+            <th>Counter 与 Histogram</th>
+            <th>ObservableCounter</th>
+            <th>UpDownCounter 与 ObservableUpDownCounter</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>cumulative</code></td>
+            <td>Cumulative</td>
+            <td>Cumulative</td>
+            <td>Cumulative</td>
+          </tr>
+          <tr>
+            <td><code>delta</code></td>
+            <td>Delta</td>
+            <td>Delta</td>
+            <td>Cumulative</td>
+          </tr>
+          <tr>
+            <td><code>lowmemory</code></td>
+            <td>Delta</td>
+            <td>Cumulative</td>
+            <td>Cumulative</td>
+          </tr>
+          <tr>
+            <td>未设置、为空或仅空白</td>
+            <td>Delta</td>
+            <td>Cumulative</td>
+            <td>Cumulative</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <p>取值不区分大小写。无效的非空取值会使用上游 exporter 的 cumulative 默认值，并产生其配置警告。Gauge 仍为瞬时测量。未设置时的行为会保留各组件既有的聚合语义。</p>
+
+      <p>类 Prometheus 后端期望 cumulative 的 counter 与 histogram。请在组件环境中设置 <code>OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE=cumulative</code>，或在摄入 delta 指标时配置 Collector 的 <code>deltatocumulative</code> processor。请在组件启动前选定该设置；这些环境变量不会热重载。</p>
+    </main>
+  </div>
+</body>
+</html>

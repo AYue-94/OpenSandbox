@@ -1,0 +1,823 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>安全容器运行时 · OpenSandbox 指南（中文）</title>
+  <meta name="description" content="使用 gVisor、Kata Containers 与 Firecracker microVM 实现硬件级沙箱隔离。" />
+  <link rel="stylesheet" href="guides-zh.css" />
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <a class="brand" href="index.html">OpenSandbox</a>
+      <div class="brand-sub">功能指南 · 中文版</div>
+      <h2>目录</h2>
+      <nav>
+      <a href="index.html">总览</a>
+      <a href="credential-vault.html">凭证保管库</a>
+      <a href="secure-access.html">安全访问</a>
+      <a href="secure-container.html" class="active">安全容器运行时</a>
+      <a href="multi-tenancy.html">多租户</a>
+      <a href="isolation-sessions.html">隔离会话</a>
+      <a href="pause-resume.html">暂停与恢复</a>
+      <a href="qemu-vmstate-snapshots.html">QEMU VMState 快照</a>
+      <a href="egress-sse-truncation.html">Egress SSE 截断</a>
+      <a href="lifecycle-hooks.html">生命周期钩子</a>
+      <a href="windows-sandbox.html">Windows 沙箱</a>
+      <a href="client-pool.html">客户端 Pool</a>
+      <a href="component-telemetry.html">组件遥测</a>
+      </nav>
+      <p class="note" style="margin-top:1.5rem">由英文 docs/guides/*.md 翻译的静态 HTML，便于本地阅读。</p>
+    </aside>
+    <main class="content">
+      <header class="page-head">
+        <h1>安全容器运行时</h1>
+        <p class="desc">使用 gVisor、Kata Containers 与 Firecracker microVM 实现硬件级沙箱隔离。</p>
+      </header>
+      <nav class="toc">
+        <strong>本页目录</strong>
+        <ol>
+          <li><a href="#overview">概述</a></li>
+          <li><a href="#server-config">服务端配置</a></li>
+          <li><a href="#docker-mode">Docker 模式</a></li>
+          <li><a href="#kubernetes-mode">Kubernetes 模式</a></li>
+          <li><a href="#user-guide">用户指南</a></li>
+          <li><a href="#admin-guide">管理员指南</a></li>
+          <li><a href="#troubleshooting">故障排查与最佳实践</a></li>
+        </ol>
+      </nav>
+
+      <p>本指南说明如何在 OpenSandbox 中使用安全容器运行时，为执行不受信任的 AI 生成代码提供硬件级隔离。</p>
+
+      <h2 id="overview">概述</h2>
+
+      <h3>什么是安全容器运行时？</h3>
+
+      <p>相比 Docker 与 containerd 使用的标准 runc 运行时，安全容器运行时能提供更强的隔离。它们通过不同机制叠加额外安全层：</p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Runtime</th>
+            <th>隔离机制</th>
+            <th>启动开销</th>
+            <th>内存开销</th>
+            <th>最适合</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>runc</strong>（默认）</td>
+            <td>进程级 cgroups</td>
+            <td>~0ms</td>
+            <td>极小</td>
+            <td>受信工作负载、本地开发</td>
+          </tr>
+          <tr>
+            <td><strong>gVisor</strong></td>
+            <td>用户态内核（系统调用拦截）</td>
+            <td>~10-50ms</td>
+            <td>~50MB</td>
+            <td>开销较低的通用工作负载</td>
+          </tr>
+          <tr>
+            <td><strong>Kata (QEMU)</strong></td>
+            <td>带 QEMU hypervisor 的完整 VM</td>
+            <td>~500ms</td>
+            <td>~20-50MB</td>
+            <td>最大兼容性与隔离</td>
+          </tr>
+          <tr>
+            <td><strong>Kata (Firecracker)</strong></td>
+            <td>带 Firecracker hypervisor 的 MicroVM</td>
+            <td>~125ms</td>
+            <td>~5MB</td>
+            <td>高密度、极小占用</td>
+          </tr>
+          <tr>
+            <td><strong>Kata (CLH)</strong></td>
+            <td>Cloud Hypervisor</td>
+            <td>~200ms</td>
+            <td>~10-20MB</td>
+            <td>性能与隔离的平衡</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>为什么使用安全运行时？</h3>
+
+      <p>OpenSandbox 设计用于执行由 AI 模型（Claude、GPT-4、Gemini 等）生成的不受信任代码。安全运行时提供：</p>
+      <ol>
+        <li><strong>容器逃逸防护</strong>：阻止恶意代码冲出容器</li>
+        <li><strong>内核级隔离</strong>：每个沙箱获得自己的内核上下文</li>
+        <li><strong>多租户安全</strong>：不同用户的沙箱被强隔离</li>
+        <li><strong>合规性</strong>：满足受监管行业的安全要求</li>
+      </ol>
+
+      <h3>支持的运行时类型</h3>
+
+      <p>OpenSandbox 通过服务端级配置支持以下安全运行时类型：</p>
+      <ul>
+        <li><code>"gvisor"</code> — Google gVisor（runsc）</li>
+        <li><code>"kata"</code> — 使用 QEMU hypervisor 的 Kata Containers（默认）</li>
+        <li><code>"firecracker"</code> — 使用 Firecracker hypervisor 的 Kata Containers</li>
+        <li><code>""</code>（空）— 标准 runc（默认，无安全运行时）</li>
+      </ul>
+
+      <h3>关键设计原则</h3>
+
+      <p><strong>服务端级配置</strong>：安全运行时由管理员在服务端统一配置一次。该服务器上的所有沙箱都会透明使用已配置的运行时。SDK 用户与 API 调用方<strong>无需修改代码</strong>。</p>
+
+      <h2 id="server-config">服务端配置</h2>
+
+      <p>安全运行时通过 <code>~/.sandbox.toml</code> 配置文件设置。服务端会在启动时校验已配置的运行时；若不可用，将拒绝启动。</p>
+
+      <h3>配置文件</h3>
+
+      <p>编辑 <code>~/.sandbox.toml</code>：</p>
+
+<pre><code>[runtime]
+type = "docker"  # or "kubernetes"
+execd_image = "opensandbox/execd:latest"
+
+# Secure container runtime configuration
+# When enabled, ALL sandboxes on this server use the specified runtime
+[secure_runtime]
+# Runtime type: "", "gvisor", "kata", "firecracker"
+type = ""
+
+# Docker mode: OCI runtime name (e.g., "runsc" for gVisor, "kata-runtime" for Kata)
+# Required when runtime.type = "docker" and type is not empty
+docker_runtime = "runsc"
+
+# Kubernetes mode: RuntimeClass name (e.g., "gvisor", "kata-qemu", "kata-fc")
+# Required when runtime.type = "kubernetes" and type is not empty
+k8s_runtime_class = "gvisor"</code></pre>
+
+      <h3>配置示例</h3>
+
+      <h4>示例 1：Docker 上的 gVisor</h4>
+
+<pre><code>[runtime]
+type = "docker"
+execd_image = "opensandbox/execd:latest"
+
+[secure_runtime]
+type = "gvisor"
+docker_runtime = "runsc"
+k8s_runtime_class = "gvisor"</code></pre>
+
+      <h4>示例 2：Kubernetes 上的 Kata Containers</h4>
+
+<pre><code>[runtime]
+type = "kubernetes"
+execd_image = "opensandbox/execd:latest"
+
+[secure_runtime]
+type = "kata"
+docker_runtime = "kata-runtime"
+k8s_runtime_class = "kata-qemu"</code></pre>
+
+      <h4>示例 3：Kubernetes 上的 Kata + Firecracker</h4>
+
+<pre><code>[runtime]
+type = "kubernetes"
+execd_image = "opensandbox/execd:latest"
+
+[secure_runtime]
+type = "firecracker"
+docker_runtime = ""  # Not supported in Docker mode
+k8s_runtime_class = "kata-fc"</code></pre>
+
+      <h3>启动校验</h3>
+
+      <p>服务端启动时会自动校验已配置的安全运行时是否可用：</p>
+
+<pre><code>$ opensandbox-server
+INFO     Validating secure runtime for Docker backend
+INFO     Docker OCI runtime 'runsc' is available: {...}
+INFO     Application startup complete.</code></pre>
+
+      <p>若运行时不可用，服务端将拒绝启动，并给出明确错误信息：</p>
+
+<pre><code>ERROR    Configured Docker runtime 'runsc' is not available.
+        Available runtimes: runc.
+        Please install and configure it in /etc/docker/daemon.json.</code></pre>
+
+      <h2 id="docker-mode">Docker 模式</h2>
+
+      <p>Docker 模式对安全容器运行时有完整支持。</p>
+
+      <h3>前置条件</h3>
+      <ul>
+        <li>已安装并运行 Docker daemon</li>
+        <li>主机上已安装安全运行时</li>
+      </ul>
+
+      <h3>Docker 下的 gVisor 安装</h3>
+
+      <h4>步骤 1：安装 gVisor runsc</h4>
+
+      <p>对于 Docker 模式，只需安装 <strong>runsc</strong> OCI runtime：</p>
+
+<pre><code># Ubuntu/Debian
+curl -fsSL https://gvisor.dev/archive.key | sudo gpg --dearmor -o /usr/share/keyrings/gvisor-archive-keyring.gpg
+echo "deb [signed-by=/usr/share/keyrings/gvisor-archive-keyring.gpg] https://storage.googleapis.com/gvisor/releases release main" | \
+  sudo tee /etc/apt/sources.list.d/gvisor.list
+sudo apt-get update &amp;&amp; sudo apt-get install -y runsc
+
+# Verify installation
+runsc --version</code></pre>
+
+      <div class="callout tip">
+        <span class="label">提示</span>
+        <p>对于 Docker 模式，只需要 <code>runsc</code>。<code>containerd-shim-runsc-v1</code> 仅在 Kubernetes/containerd 场景需要。</p>
+        <p><strong>参考</strong>：其他发行版与安装方式见 <a href="https://gvisor.dev/docs/user_guide/install/">gVisor Installation Guide</a>。</p>
+      </div>
+
+      <h4>步骤 2：配置 Docker daemon</h4>
+
+      <p>使用 <code>runsc install</code> 命令自动配置 Docker daemon：</p>
+
+<pre><code>sudo runsc install</code></pre>
+
+      <p>或手动编辑 <code>/etc/docker/daemon.json</code>：</p>
+
+<pre><code>{
+  "runtimes": {
+    "runsc": {
+      "path": "/usr/bin/runsc",
+      "runtimeArgs": [
+        "--platform=systrap",
+        "--network=host",
+        "--overlay2=none"
+      ]
+    }
+  }
+}</code></pre>
+
+      <div class="callout warning">
+        <span class="label">警告</span>
+        <p><strong>Docker 快照需要 <code>--overlay2=none</code></strong></p>
+        <p>runsc 通常会把根文件系统变更保留在自己的 <code>root:self</code> overlay 中。Docker 无法把这些变更纳入 <code>docker commit</code>，因此 Docker 后端的 OpenSandbox 快照可能报告成功，但恢复时只得到原始镜像。若使用 snapshot、fork 或 restore 工作流，请在 runtime 参数中保留 <code>--overlay2=none</code>。这样沙箱写入对 Docker 存储驱动可见，从而可进入快照镜像。</p>
+        <p>在未带该参数创建的现有 runsc 安装中，必须先更新 <code>daemon.json</code> 并重启 Docker，再拍摄快照。根文件系统 overlay 行为见 gVisor
+          <a href="https://gvisor.dev/docs/user_guide/filesystem/">filesystem documentation</a>。</p>
+      </div>
+
+      <p>重启 Docker：</p>
+
+<pre><code>sudo systemctl restart docker</code></pre>
+
+      <div class="callout tip">
+        <span class="label">提示</span>
+        <p><strong>参考</strong>：更多细节见 <a href="https://gvisor.dev/docs/user_guide/quick_start/docker/">gVisor Docker Quick Start</a>。</p>
+      </div>
+
+      <h4>步骤 3：配置 OpenSandbox Server</h4>
+
+      <p>编辑 <code>~/.sandbox.toml</code>：</p>
+
+<pre><code>[runtime]
+type = "docker"
+execd_image = "opensandbox/execd:latest"
+
+[secure_runtime]
+type = "gvisor"
+docker_runtime = "runsc"</code></pre>
+
+      <h4>步骤 4：启动服务端并验证</h4>
+
+<pre><code>opensandbox-server</code></pre>
+
+      <p>创建测试沙箱：</p>
+
+<pre><code>curl -X POST http://localhost:8080/v1/sandboxes \
+  -H "Content-Type: application/json" \
+  -d '{
+    "image": {"uri": "python:3.11"},
+    "timeout": 3600,
+    "resourceLimits": {"cpu": "500m", "memory": "512Mi"},
+    "entrypoint": ["python", "-u", "-c", "import time\nwhile True: print('hello from gVisor!'); time.sleep(1)"],
+    "metadata": {
+      "name": "gvisor-docker-sandbox"
+    }
+  }'</code></pre>
+
+      <p>验证运行时：</p>
+
+<pre><code>docker ps --format "{{.ID}}\t{{.Image}}\t{{.Names}}"
+docker inspect &lt;container_id&gt; | grep -A2 Runtime
+# Expected output:
+# "Runtime": "runsc",</code></pre>
+
+      <h3>Docker 下的 Kata Containers 安装</h3>
+
+      <h4>系统要求</h4>
+
+      <p>Kata Containers 需要硬件虚拟化支持。请确认系统满足以下要求：</p>
+
+      <p><strong>硬件虚拟化支持：</strong></p>
+<pre><code># Check if CPU supports hardware virtualization (VT-x for Intel, AMD-V for AMD)
+lscpu | grep Virtualization
+# Expected output: Virtualization: VT-x (Intel) or AMD-V (AMD)
+
+# Alternatively on Intel
+grep -E --color=auto 'vmx|svm' /proc/cpuinfo
+# Expected: vmx (Intel) or svm (AMD) flags present</code></pre>
+
+      <p><strong>KVM 模块：</strong></p>
+<pre><code># Check if KVM module is loaded
+lsmod | grep kvm
+# Expected: kvm_intel (Intel) or kvm_amd (AMD)
+
+# If not loaded, load KVM module
+sudo modprobe kvm_intel  # For Intel
+# or
+sudo modprobe kvm_amd    # For AMD</code></pre>
+
+      <p><strong>内核要求：</strong></p>
+      <ul>
+        <li>建议 Linux kernel 5.10 或更高</li>
+        <li>内核配置已启用 KVM</li>
+      </ul>
+
+      <p><strong>Docker 要求：</strong></p>
+      <ul>
+        <li>Docker 20.10 或更高</li>
+        <li><code>/etc/docker/daemon.json</code> 已为 Kata runtime 配置</li>
+      </ul>
+
+      <h4>安装</h4>
+
+      <p>从 GitHub releases 下载并安装 Kata Containers 静态二进制：</p>
+
+<pre><code># Find the latest release at https://github.com/kata-containers/kata-containers/releases
+KATA_VERSION="3.27.0"
+wget https://github.com/kata-containers/kata-containers/releases/download/${KATA_VERSION}/kata-static-${KATA_VERSION}-amd64.tar.zst
+
+# Extract to root directory - Kata will be installed in /opt/kata
+zstd -d kata-static-${KATA_VERSION}-amd64.tar.zst
+tar -xvf kata-static-${KATA_VERSION}-amd64.tar -C /
+
+# Create symbolic links for PATH access
+sudo ln -sf /opt/kata/bin/kata-runtime /usr/local/bin/kata-runtime
+sudo ln -sf /opt/kata/bin/containerd-shim-kata-v2 /usr/local/bin/containerd-shim-kata-v2
+
+# Verify installation
+kata-runtime --version</code></pre>
+
+      <h4>配置 Docker Daemon</h4>
+
+      <p>编辑 <code>/etc/docker/daemon.json</code>，将 Kata 注册为 runtime：</p>
+
+<pre><code>{
+  "default-runtime": "runc",
+  "runtimes": {
+    "kata": {
+      "runtimeType": "io.containerd.kata.v2"
+    }
+  }
+}</code></pre>
+
+      <p>重启 Docker 使变更生效：</p>
+
+<pre><code>sudo systemctl restart docker
+
+# Verify Kata is available in Docker
+docker info | grep -A5 Runtimes
+# Expected output should include "io.containerd.runc.v2 kata"</code></pre>
+
+      <h4>配置 OpenSandbox Server</h4>
+
+      <p>编辑 <code>~/.sandbox.toml</code>：</p>
+
+<pre><code>[runtime]
+type = "docker"
+execd_image = "opensandbox/execd:latest"
+
+[secure_runtime]
+type = "kata"
+docker_runtime = "kata"</code></pre>
+
+      <h4>验证安装</h4>
+
+      <p><strong>使用 OpenSandbox API 测试</strong></p>
+
+      <p>创建沙箱，并通过检查内核验证它运行在 VM 中：</p>
+
+<pre><code># Create a test sandbox
+curl --location 'http://127.0.0.1:8080/v1/sandboxes' \
+  --header 'Content-Type: application/json' \
+  --data '{
+    "image": {"uri": "ubuntu:latest"},
+    "timeout": 3600,
+    "resourceLimits": {"cpu": "500m", "memory": "512Mi"},
+    "entrypoint": ["/bin/bash", "-c", "while true; do uname -a; sleep 1; done"],
+    "metadata": {
+      "name": "kata-sandbox"
+    }
+  }'</code></pre>
+
+      <p>检查容器内内核以验证 VM 隔离：</p>
+
+<pre><code># Get the container ID
+docker ps | grep kata-sandbox
+
+# Check the kernel inside the container (should be different from host)
+docker exec &lt;container_id&gt; uname -a
+# Expected output: Linux &lt;hostname&gt; 5.10.x-generic #x86_64 ... (Kata VM kernel)
+
+# Compare with host kernel
+uname -a
+# Host kernel might be different version or have different hostname</code></pre>
+
+      <p><strong>Kata VM 的关键指标：</strong></p>
+      <ul>
+        <li>容器运行在独立内核中，主机名不同</li>
+        <li>内核版本通常为 <code>5.10.x</code>（Kata 的 guest kernel）</li>
+        <li>主机进程列表显示 <code>qemu-system-x86_64</code> 或类似 hypervisor 进程</li>
+      </ul>
+
+      <h2 id="kubernetes-mode">Kubernetes 模式</h2>
+
+      <p>Kubernetes 模式通过 RuntimeClass 资源支持安全运行时。</p>
+
+      <h3>前置条件</h3>
+      <ul>
+        <li>使用 containerd 运行时的 Kubernetes 集群</li>
+        <li>所有节点已安装安全运行时</li>
+        <li>已创建 RuntimeClass CRD</li>
+      </ul>
+
+      <h3>Kubernetes 下的 gVisor 安装</h3>
+
+      <h4>步骤 1：在所有节点安装 gVisor 组件</h4>
+
+      <p>对于使用 containerd 的 Kubernetes，需要安装<strong>两个</strong>组件：</p>
+      <ol>
+        <li><strong>runsc</strong> — gVisor OCI runtime</li>
+        <li><strong>containerd-shim-runsc-v1</strong> — 面向 gVisor 的 containerd shim</li>
+      </ol>
+
+<pre><code># On each node - Ubuntu/Debian
+curl -fsSL https://gvisor.dev/archive.key | sudo gpg --dearmor -o /usr/share/keyrings/gvisor-archive-keyring.gpg
+echo "deb [signed-by=/usr/share/keyrings/gvisor-archive-keyring.gpg] https://storage.googleapis.com/gvisor/releases release main" | \
+  sudo tee /etc/apt/sources.list.d/gvisor.list
+sudo apt-get update
+
+# Install both gVisor components
+sudo apt-get install -y runsc containerd-shim-runsc-v1
+
+# Verify installation
+runsc --version
+containerd-shim-runsc-v1 --version</code></pre>
+
+      <div class="callout tip">
+        <span class="label">提示</span>
+        <p><strong>参考</strong>：完整安装说明与其他发行版见
+          <a href="https://gvisor.dev/docs/user_guide/containerd/configuration/">gVisor Installation Guide</a>。</p>
+      </div>
+
+      <h4>步骤 2：配置 containerd</h4>
+
+      <p>编辑 <code>/etc/containerd/config.toml</code>：</p>
+
+<pre><code>[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runsc]
+          runtime_type = "io.containerd.runsc.v1"
+          [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runsc.options]
+            TypeUrl = "io.containerd.runsc.v1.options"
+            ConfigPath = "/etc/containerd/runsc.toml"</code></pre>
+
+<pre><code>sudo tee /etc/containerd/runsc.toml &gt; /dev/null &lt;&lt;'EOF'
+[runsc]
+  platform = "ptrace"
+EOF</code></pre>
+
+      <p>重启 containerd：</p>
+
+<pre><code>sudo systemctl restart containerd</code></pre>
+
+      <h4>步骤 3：创建 RuntimeClass CRD</h4>
+
+<pre><code># gvisor-runtimeclass.yaml
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: gvisor
+handler: runsc
+scheduling:
+  nodeSelector:
+    kubernetes.io/arch: amd64</code></pre>
+
+<pre><code>kubectl apply -f gvisor-runtimeclass.yaml</code></pre>
+
+      <h4>步骤 4：配置 OpenSandbox Server</h4>
+
+      <p>编辑 <code>~/.sandbox.toml</code>：</p>
+
+<pre><code>[runtime]
+type = "kubernetes"
+execd_image = "opensandbox/execd:latest"
+
+[secure_runtime]
+type = "gvisor"
+k8s_runtime_class = "gvisor"</code></pre>
+
+      <h4>步骤 5：验证安装</h4>
+
+<pre><code># Test the RuntimeClass
+kubectl run test-gvisor --restart=Never --image=hello-world --runtime-class=gvisor
+kubectl logs test-gvisor
+kubectl delete pod test-gvisor</code></pre>
+
+      <h3>Kubernetes 下的 Kata Containers 安装</h3>
+
+      <h4>步骤 1：安装 Kata Containers</h4>
+
+      <p>请遵循
+        <a href="https://github.com/kata-containers/kata-containers/blob/main/tools/packaging/kata-deploy/helm-chart/README.md">官方 Kata Containers 安装指南</a>。</p>
+
+      <p>使用 Helm 快速安装：</p>
+
+<pre><code># Install kata-deploy which will set up Kata Containers via DaemonSet
+helm install kata-deploy "oci://ghcr.io/kata-containers/kata-deploy-charts/kata-deploy" --version "3.27.0" --namespace kube-system --create-namespace
+
+# Wait for kata-deploy pods to be ready
+kubectl wait --for=condition=ready pod -l name=kata-deploy -n kube-system --timeout=300s</code></pre>
+
+      <div class="callout tip">
+        <span class="label">提示</span>
+        <p><code>kata-deploy</code> DaemonSet 会自动在所有节点上配置 containerd。使用 kata-deploy 时无需手工配置 containerd。</p>
+      </div>
+
+      <h4>步骤 2：验证安装</h4>
+
+      <p>检查 Kata Containers 是否已安装，以及 RuntimeClass 是否已创建：</p>
+
+<pre><code># Check RuntimeClasses
+kubectl get runtimeclass
+
+# Expected output:
+# NAME         HANDLER     AGE
+# kata         kata-qemu   10m
+# kata-qemu    kata-qemu   10m
+# kata-clh     kata-clh    10m
+# kata-fc      kata-fc     10m
+
+# Test Kata with a simple pod
+kubectl run test-kata --restart=Never --image=hello-world --runtime-class=kata-qemu
+kubectl logs test-kata
+kubectl delete pod test-kata</code></pre>
+
+      <h3>为不同运行时创建 Pool（可选）</h3>
+
+      <p>使用 Pool CRD 做预热沙箱时，请为每种运行时类型创建独立的 pool：</p>
+
+<pre><code># gvisor-pool.yaml
+apiVersion: sandbox.opensandbox.io/v1alpha1
+kind: Pool
+metadata:
+  name: gvisor-pool
+  labels:
+    runtime: gvisor
+spec:
+  template:
+    spec:
+      runtimeClassName: gvisor
+      containers:
+        - name: sandbox-container
+          image: opensandbox/code-interpreter:v1.1.0
+  capacitySpec:
+    bufferMax: 10
+    bufferMin: 2
+    poolMax: 20
+    poolMin: 5</code></pre>
+
+      <h2 id="user-guide">用户指南</h2>
+
+      <p>本节面向使用 OpenSandbox 的 AI 应用开发者。</p>
+
+      <h3>无需修改代码</h3>
+
+      <p><strong>重要</strong>：安全运行时在服务端级配置。你的代码无需变更。</p>
+
+      <p>只需通过 OpenSandbox Lifecycle API 创建沙箱——服务端会自动应用已配置的安全运行时：</p>
+
+      <p><strong>创建测试沙箱：</strong></p>
+
+<pre><code>curl -X POST http://localhost:8080/v1/sandboxes \
+  -H "Content-Type: application/json" \
+  -d '{
+    "image": {"uri": "python:3.11"},
+    "timeout": 3600,
+    "resourceLimits": {"cpu": "500m", "memory": "512Mi"},
+    "entrypoint": ["python", "-u", "-c", "import time\nwhile True: print(\"hello from secure sandbox!\"); time.sleep(1)"],
+    "metadata": {
+      "name": "my-secure-sandbox"
+    }
+  }'</code></pre>
+
+      <p><strong>响应：</strong></p>
+
+<pre><code>{
+  "id": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "running"
+}</code></pre>
+
+      <p>沙箱会自动使用服务端已配置的安全运行时（gVisor、Kata 或 runc）。</p>
+
+      <h3>工作原理</h3>
+
+      <ol>
+        <li><strong>管理员</strong>在 <code>~/.sandbox.toml</code> 中配置安全运行时</li>
+        <li><strong>服务端</strong>在启动时校验运行时</li>
+        <li><strong>服务端</strong>自动把运行时注入每个沙箱：
+          <ul>
+            <li>Docker 模式：向 HostConfig 添加 <code>runtime</code></li>
+            <li>Kubernetes 模式：向 Pod spec 添加 <code>runtimeClassName</code></li>
+          </ul>
+        </li>
+        <li><strong>用户</strong>通过 API 创建沙箱——无需 runtime 参数</li>
+      </ol>
+
+      <h3>验证运行时隔离</h3>
+
+      <p>创建沙箱后，验证正在使用的运行时：</p>
+
+      <p><strong>Docker 模式：</strong></p>
+<pre><code>docker ps --format "{{.ID}}\t{{.Image}}\t{{.Names}}"
+docker inspect &lt;container_id&gt; | grep -A2 Runtime
+# Expected output for gVisor:
+# "Runtime": "runsc",</code></pre>
+
+      <p><strong>Kubernetes 模式：</strong></p>
+<pre><code>kubectl get pod &lt;pod-name&gt; -o jsonpath='{.spec.runtimeClassName}'
+# Expected output for gVisor:
+# gvisor</code></pre>
+
+      <h2 id="admin-guide">管理员指南</h2>
+
+      <p>本节面向管理安全运行时基础设施的平台运维与 SRE。</p>
+
+      <h3>前置条件</h3>
+
+      <p>在配置 OpenSandbox <strong>之前</strong>，必须先在基础设施上安装并配置安全运行时。OpenSandbox 不会自动安装运行时。</p>
+
+      <h3>安装摘要</h3>
+
+      <table>
+        <thead>
+          <tr><th>Runtime</th><th>Docker</th><th>Kubernetes</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>gVisor</td>
+            <td>安装 runsc → 配置 daemon.json</td>
+            <td>安装 runsc → 配置 containerd → 创建 RuntimeClass</td>
+          </tr>
+          <tr>
+            <td>Kata (QEMU)</td>
+            <td>安装 kata-runtime → 配置 daemon.json</td>
+            <td>安装 Kata → 配置 containerd → 创建 RuntimeClass</td>
+          </tr>
+          <tr>
+            <td>Kata (Firecracker)</td>
+            <td>不支持</td>
+            <td>安装 Kata → 配置 containerd → 创建 RuntimeClass</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>配置校验</h3>
+
+      <p>服务端在启动时校验安全运行时配置：</p>
+      <ol>
+        <li><strong>Docker 模式</strong>：检查运行时是否存在于 Docker daemon 的 runtime 列表</li>
+        <li><strong>Kubernetes 模式</strong>：检查集群中是否存在 RuntimeClass</li>
+      </ol>
+      <p>若校验失败，服务端会拒绝启动，并给出明确错误信息。</p>
+
+      <h3>安全最佳实践</h3>
+      <ol>
+        <li><strong>默认使用 gVisor</strong>：对大多数工作负载提供良好安全与可接受的性能</li>
+        <li><strong>对不受信任代码使用 Kata</strong>：对完全未知代码提供最大隔离</li>
+        <li><strong>定期更新</strong>：保持运行时更新以获取安全补丁</li>
+        <li><strong>测试兼容性</strong>：上线前用所选运行时验证工作负载</li>
+        <li><strong>监控资源</strong>：安全运行时有更高的内存开销</li>
+      </ol>
+
+      <h3>运行时选型指南</h3>
+
+      <table>
+        <thead>
+          <tr><th>使用场景</th><th>推荐运行时</th><th>理由</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>开发 / 测试</td><td>runc（默认）</td><td>启动最快、开销最低</td></tr>
+          <tr><td>生产 AI 代码执行</td><td>gVisor</td><td>安全与性能平衡良好</td></tr>
+          <tr><td>高安全要求</td><td>Kata (QEMU)</td><td>最大隔离、完整兼容</td></tr>
+          <tr><td>高密度多租户</td><td>Kata (Firecracker)</td><td>每个沙箱内存开销最小</td></tr>
+          <tr><td>不受信任的网络代码</td><td>gVisor 或 Kata</td><td>系统调用过滤可阻止网络攻击</td></tr>
+        </tbody>
+      </table>
+
+      <h2 id="troubleshooting">故障排查与最佳实践</h2>
+
+      <h3>常见问题</h3>
+
+      <h4>1. 找不到运行时（Docker）</h4>
+
+      <p><strong>错误</strong>：<code>Configured Docker runtime 'runsc' is not available.</code></p>
+
+      <p><strong>解决</strong>：确认运行时已配置在 <code>/etc/docker/daemon.json</code> 中，并且 Docker 已重启：</p>
+
+<pre><code>sudo systemctl restart docker
+docker info | grep -A5 Runtimes</code></pre>
+
+      <h4>2. 找不到 RuntimeClass（Kubernetes）</h4>
+
+      <p><strong>错误</strong>：<code>RuntimeClass 'gvisor' does not exist.</code></p>
+
+      <p><strong>解决</strong>：创建 RuntimeClass CRD：</p>
+
+<pre><code>kubectl get runtimeclass
+kubectl apply -f gvisor-runtimeclass.yaml</code></pre>
+
+      <h4>3. 系统调用兼容性问题</h4>
+
+      <p><strong>错误</strong>：容器以 exit code 1 退出，没有日志</p>
+
+      <p><strong>原因</strong>：gVisor 未实现全部系统调用。部分应用可能不兼容。</p>
+
+      <p><strong>解决</strong>：查看 <a href="https://gvisor.dev/docs/user_guide/compatibility/">gVisor compatibility guide</a>。可尝试兼容性更好的 Kata (QEMU)。</p>
+
+      <h4>4. Pod 卡在 ContainerCreating</h4>
+
+      <p><strong>原因</strong>：节点上未配置 RuntimeClass handler。</p>
+
+      <p><strong>解决</strong>：验证 containerd 配置：</p>
+
+<pre><code># On the node
+sudo containerd config dump
+sudo systemctl restart containerd</code></pre>
+
+      <h4>5. Egress Sidecar 与 gVisor 不兼容</h4>
+
+      <p><strong>错误</strong>：沙箱 Pod 处于 CrashLoopBackOff，egress 容器日志显示：</p>
+<pre><code>iptables: Failed to initialize nft: Protocol not supported</code></pre>
+      <p>或使用 iptables-legacy 时：</p>
+<pre><code>iptables v1.8.9 (legacy): can't initialize iptables table 'nat': Table does not exist (do you need to insmod?)</code></pre>
+
+      <p><strong>原因</strong>：gVisor 的 netstack 实现了 <code>filter</code> 与 <code>mangle</code> iptables 表，但未实现 <code>nat</code> 表。Egress sidecar 使用 <code>nat</code> 表中的 REDIRECT 规则拦截 DNS 查询（端口 53 → 15353），因此在 gVisor 下无法启动。这是上游 gVisor 限制（<a href="https://github.com/google/gvisor/issues/170">gvisor#170</a>）。</p>
+
+      <p><strong>解决</strong>：</p>
+      <ul>
+        <li>使用 <code>secure_runtime.type = "kata"</code> 与 <code>k8s_runtime_class = "kata-qemu"</code>——Kata 为每个 Pod 提供完整 Linux 内核，因此 <code>nat</code> 表可用，egress sidecar 无需改动即可工作。</li>
+        <li>在 gVisor 下用 CNI 级 FQDN 策略（例如 Cilium <code>toFQDNs</code>）替代 egress sidecar 做网络隔离。</li>
+        <li>若不需要 egress 控制，从沙箱创建请求中移除 <code>network_policy</code>。</li>
+      </ul>
+
+      <div class="callout tip">
+        <span class="label">提示</span>
+        <p>服务端会在请求时校验该组合；当同时使用 <code>secure_runtime.type = "gvisor"</code> 与 <code>network_policy</code> 时，会返回 HTTP 400 与明确错误信息。</p>
+      </div>
+
+      <h3>兼容性矩阵</h3>
+
+      <table>
+        <thead>
+          <tr>
+            <th>功能</th>
+            <th>runc</th>
+            <th>gVisor</th>
+            <th>Kata (QEMU)</th>
+            <th>Kata (CLH)</th>
+            <th>Kata (FC)</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td>系统调用兼容性</td><td>完整</td><td>部分</td><td>完整</td><td>完整</td><td>有限</td></tr>
+          <tr><td>GPU 支持</td><td>Yes</td><td>No</td><td>Yes</td><td>Yes</td><td>No</td></tr>
+          <tr><td>IPv6</td><td>Yes</td><td>Yes</td><td>Yes</td><td>Yes</td><td>Yes</td></tr>
+          <tr><td>Privileged Mode</td><td>Yes</td><td>No</td><td>Yes</td><td>Yes</td><td>No</td></tr>
+          <tr><td>Docker Volume</td><td>Yes</td><td>Yes</td><td>Yes</td><td>Yes</td><td>Yes</td></tr>
+          <tr><td>Systemd</td><td>Yes</td><td>No</td><td>Yes</td><td>Yes</td><td>No</td></tr>
+          <tr><td>iptables <code>nat</code> 表（egress sidecar）</td><td>Yes</td><td><strong>No</strong></td><td>Yes</td><td>Yes</td><td>Yes</td></tr>
+        </tbody>
+      </table>
+
+      <h3>获取帮助</h3>
+      <ul>
+        <li><strong>文档</strong>：<a href="https://github.com/opensandbox-group/OpenSandbox">OpenSandbox GitHub</a></li>
+        <li><strong>Issues</strong>：通过 <a href="https://github.com/opensandbox-group/OpenSandbox/issues">GitHub Issues</a> 报告缺陷</li>
+      </ul>
+
+      <div class="footer-nav">
+        <a href="secure-access.html">← 安全访问</a>
+        <a href="multi-tenancy.html">多租户 →</a>
+      </div>
+    </main>
+  </div>
+</body>
+</html>

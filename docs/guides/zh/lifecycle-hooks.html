@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>生命周期钩子 · OpenSandbox 指南（中文）</title>
+  <meta name="description" content="在沙箱入口点启动前执行准备工作，并在运行期间调度周期性任务。" />
+  <link rel="stylesheet" href="guides-zh.css" />
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <a class="brand" href="index.html">OpenSandbox</a>
+      <div class="brand-sub">功能指南 · 中文版</div>
+      <h2>目录</h2>
+      <nav>
+      <a href="index.html">总览</a>
+      <a href="credential-vault.html">凭证保管库</a>
+      <a href="secure-access.html">安全访问</a>
+      <a href="secure-container.html">安全容器运行时</a>
+      <a href="multi-tenancy.html">多租户</a>
+      <a href="isolation-sessions.html">隔离会话</a>
+      <a href="pause-resume.html">暂停与恢复</a>
+      <a href="qemu-vmstate-snapshots.html">QEMU VMState 快照</a>
+      <a href="egress-sse-truncation.html">Egress SSE 截断</a>
+      <a href="lifecycle-hooks.html" class="active">生命周期钩子</a>
+      <a href="windows-sandbox.html">Windows 沙箱</a>
+      <a href="client-pool.html">客户端 Pool</a>
+      <a href="component-telemetry.html">组件遥测</a>
+      </nav>
+      <p class="note" style="margin-top:1.5rem">由英文 docs/guides/*.md 翻译的静态 HTML，便于本地阅读。</p>
+    </aside>
+    <main class="content">
+      <header class="page-head">
+        <h1>生命周期钩子</h1>
+        <p class="desc">在沙箱入口点启动前执行准备工作，并在运行期间调度周期性任务。</p>
+      </header>
+
+      <p>生命周期钩子允许沙箱在运行时的既定时机以声明式方式执行命令。OpenSandbox 当前支持一个阻塞式 <code>preStart</code> 钩子，以及一个或多个非阻塞的 <code>periodic</code> 钩子。</p>
+
+      <h2>支持的钩子</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>钩子</th>
+            <th>数量</th>
+            <th>运行时机</th>
+            <th>失败行为</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>preStart</code></td>
+            <td>零或一个</td>
+            <td>execd 开始监听之后、用户入口点启动之前</td>
+            <td>失败或超时会阻止用户入口点启动</td>
+          </tr>
+          <tr>
+            <td><code>periodic</code></td>
+            <td>零或多个</td>
+            <td><code>preStart</code> 成功后启动调度器，并按各自计划运行每个钩子</td>
+            <td>失败或超时的运行会被记录，后续运行通常仍会继续；若超时进程无法终止，该钩子会被禁用</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <p>两类钩子都在沙箱内部、使用沙箱环境运行。命令以参数数组形式直接执行。若需使用管道、重定向或变量展开等 shell 语法，请显式调用 shell，例如 <code>['sh', '-c', 'command &gt; file']</code>。</p>
+
+      <p><img src="../../public/images/lifecycle-hooks-startup.png" alt="bootstrap 与 execd-as-init 模式下的生命周期钩子时序" /></p>
+
+      <p>两种启动模式下的顺序相同：</p>
+      <ol>
+        <li>execd 启动，其 HTTP 服务器开始监听。</li>
+        <li>若已配置，则 <code>preStart</code> 运行至完成。</li>
+        <li>若已配置，则启动周期性调度器。</li>
+        <li>启动用户入口点。</li>
+      </ol>
+
+      <p>在 execd-as-init 模式下，execd 保持为 PID 1，并将入口点作为其受监管的子进程启动。在 bootstrap 模式下，bootstrap 进程在 execd 报告生命周期启动完成后启动入口点。</p>
+
+      <h2>配置</h2>
+      <p>生命周期钩子是沙箱创建请求的一部分：</p>
+      <pre><code>{
+  "image": { "uri": "ubuntu:24.04" },
+  "entrypoint": ["tail", "-f", "/dev/null"],
+  "resourceLimits": {
+    "cpu": "1",
+    "memory": "1Gi"
+  },
+  "lifecycle": {
+    "preStart": {
+      "command": ["sh", "-c", "echo ready &gt; /tmp/prestart.done"],
+      "timeoutSeconds": 120
+    },
+    "periodic": [
+      {
+        "name": "checkpoint",
+        "schedule": "@every 5m",
+        "command": ["sh", "-c", "date -u &gt;&gt; /tmp/checkpoints.log"],
+        "timeoutSeconds": 120
+      }
+    ]
+  }
+}</code></pre>
+
+      <h3><code>preStart</code></h3>
+      <table>
+        <thead>
+          <tr>
+            <th>字段</th>
+            <th>必填</th>
+            <th>说明</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>command</code></td>
+            <td>是</td>
+            <td>非空的命令与参数数组</td>
+          </tr>
+          <tr>
+            <td><code>timeoutSeconds</code></td>
+            <td>否</td>
+            <td>省略时默认为 60 秒；显式取值须在 1 到 10800 秒（3 小时）之间</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <p><code>preStart</code> 在每次容器启动时都会运行。请使命令幂等，以免重试或重启沙箱时破坏状态。</p>
+
+      <h3><code>periodic</code></h3>
+      <table>
+        <thead>
+          <tr>
+            <th>字段</th>
+            <th>必填</th>
+            <th>说明</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>name</code></td>
+            <td>是</td>
+            <td>非空白名称，在同一沙箱内唯一</td>
+          </tr>
+          <tr>
+            <td><code>schedule</code></td>
+            <td>是</td>
+            <td>标准五字段 cron 表达式，或诸如 <code>@hourly</code>、<code>@every 30s</code> 的描述符</td>
+          </tr>
+          <tr>
+            <td><code>command</code></td>
+            <td>是</td>
+            <td>非空的命令与参数数组</td>
+          </tr>
+          <tr>
+            <td><code>timeoutSeconds</code></td>
+            <td>否</td>
+            <td>省略时默认为 60 秒；显式取值须在 1 到 300 秒之间</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <p><code>@every</code> 间隔必须是整数秒，且至少为一秒。同一命名钩子的运行不会重叠：若上一次运行仍在进行，则跳过下一次计划运行。</p>
+
+      <h2>当前可用性</h2>
+      <p>生命周期钩子目前需要 Kubernetes provider。Docker provider 与 Fast Sandbox 后端会拒绝该配置。请求不能同时使用 <code>lifecycle</code> 与 <code>poolRef</code>。</p>
+      <p>各 SDK 在沙箱创建 API 上暴露了生命周期字段，但不强制校验超时范围。Server 是请求校验的权威。语言相关示例见 <a href="/sdks/">SDK 文档</a>。</p>
+
+      <h2>运维建议</h2>
+      <ul>
+        <li>保持 <code>preStart</code> 有界且确定，因为入口点会等待它完成。</li>
+        <li>使周期性工作幂等且可安全重试。</li>
+        <li>通过平台支持的密钥机制存储凭证，而不要嵌入命令中。</li>
+        <li>将必须在节点替换后仍保留的数据写入持久存储。生命周期钩子用于调度恢复与同步工作；它们本身不会使沙箱文件系统持久化。</li>
+      </ul>
+    </main>
+  </div>
+</body>
+</html>
