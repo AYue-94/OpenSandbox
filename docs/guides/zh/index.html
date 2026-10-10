@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>功能指南 · OpenSandbox 指南（中文）</title>
+  <meta name="description" content="沙箱生命周期、隔离、网络与安全相关指南。" />
+  <link rel="stylesheet" href="guides-zh.css" />
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <a class="brand" href="index.html">OpenSandbox</a>
+      <div class="brand-sub">功能指南 · 中文版</div>
+      <h2>目录</h2>
+      <nav>
+      <a href="index.html" class="active">总览</a>
+      <a href="credential-vault.html">凭证保管库</a>
+      <a href="secure-access.html">安全访问</a>
+      <a href="secure-container.html">安全容器运行时</a>
+      <a href="multi-tenancy.html">多租户</a>
+      <a href="isolation-sessions.html">隔离会话</a>
+      <a href="pause-resume.html">暂停与恢复</a>
+      <a href="qemu-vmstate-snapshots.html">QEMU VMState 快照</a>
+      <a href="egress-sse-truncation.html">Egress SSE 截断</a>
+      <a href="lifecycle-hooks.html">生命周期钩子</a>
+      <a href="windows-sandbox.html">Windows 沙箱</a>
+      <a href="client-pool.html">客户端 Pool</a>
+      <a href="component-telemetry.html">组件遥测</a>
+      </nav>
+      <p class="note" style="margin-top:1.5rem">由英文 docs/guides/*.md 翻译的静态 HTML，便于本地阅读。</p>
+    </aside>
+    <main class="content">
+      <header class="page-head">
+        <h1>功能指南</h1>
+        <p class="desc">沙箱生命周期、隔离、网络与安全相关指南。</p>
+      </header>
+      <p>使用这些指南，为已可用的 <a href="/getting-started/">沙箱应用</a> 增加能力。语言支持情况请参见 <a href="/sdks/#capability-coverage">SDK 能力矩阵</a>。</p>
+
+      <h2>生命周期与安全</h2>
+      <ul>
+        <li><a href="pause-resume.html">暂停与恢复</a></li>
+        <li><a href="lifecycle-hooks.html">生命周期钩子</a></li>
+        <li><a href="isolation-sessions.html">隔离会话</a></li>
+        <li><a href="credential-vault.html">凭证保管库</a></li>
+        <li><a href="secure-access.html">安全访问</a></li>
+        <li><a href="secure-container.html">安全容器运行时</a></li>
+        <li><a href="multi-tenancy.html">多租户</a></li>
+        <li><a href="windows-sandbox.html">Windows 沙箱</a></li>
+        <li><a href="qemu-vmstate-snapshots.html">QEMU VMState 快照</a></li>
+      </ul>
+
+      <h2>网络与客户端</h2>
+      <ul>
+        <li><a href="egress-sse-truncation.html">Egress SSE 截断</a></li>
+        <li><a href="client-pool.html">客户端 Pool</a></li>
+      </ul>
+
+      <h2>可观测性</h2>
+      <ul>
+        <li><a href="component-telemetry.html">组件遥测</a></li>
+      </ul>
+    </main>
+  </div>
+</body>
+</html>

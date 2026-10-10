@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>安全访问 · OpenSandbox 指南（中文）</title>
+  <meta name="description" content="使用静态请求头令牌或签名短时 URL，对发往沙箱端点的入站 HTTP 与 WebSocket 流量进行鉴权。" />
+  <link rel="stylesheet" href="guides-zh.css" />
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <a class="brand" href="index.html">OpenSandbox</a>
+      <div class="brand-sub">功能指南 · 中文版</div>
+      <h2>目录</h2>
+      <nav>
+      <a href="index.html">总览</a>
+      <a href="credential-vault.html">凭证保管库</a>
+      <a href="secure-access.html" class="active">安全访问</a>
+      <a href="secure-container.html">安全容器运行时</a>
+      <a href="multi-tenancy.html">多租户</a>
+      <a href="isolation-sessions.html">隔离会话</a>
+      <a href="pause-resume.html">暂停与恢复</a>
+      <a href="qemu-vmstate-snapshots.html">QEMU VMState 快照</a>
+      <a href="egress-sse-truncation.html">Egress SSE 截断</a>
+      <a href="lifecycle-hooks.html">生命周期钩子</a>
+      <a href="windows-sandbox.html">Windows 沙箱</a>
+      <a href="client-pool.html">客户端 Pool</a>
+      <a href="component-telemetry.html">组件遥测</a>
+      </nav>
+      <p class="note" style="margin-top:1.5rem">由英文 docs/guides/*.md 翻译的静态 HTML，便于本地阅读。</p>
+    </aside>
+    <main class="content">
+      <header class="page-head">
+        <h1>安全访问</h1>
+        <p class="desc">使用静态请求头令牌或签名短时 URL，对发往沙箱端点的入站 HTTP 与 WebSocket 流量进行鉴权。</p>
+      </header>
+
+      <p>安全访问（Secure Access）是 OpenSandbox 针对沙箱端点的入站访问控制。在沙箱上启用后，入口网关（以及服务器代理路径）要求每个调用方在 HTTP 或 WebSocket 流量到达沙箱之前证明自己已获授权。</p>
+
+      <p>相关能力：</p>
+      <ul>
+        <li><a href="credential-vault.html">凭证保管库</a> — 保护<strong>出站</strong>请求。</li>
+        <li><a href="secure-container.html">安全容器运行时</a> — 隔离<strong>工作负载</strong>。</li>
+      </ul>
+
+      <h2 id="requirements">要求</h2>
+      <ul>
+        <li>Kubernetes 运行时（Docker 会以 <code>400</code> 拒绝 <code>secureAccess: true</code>）。</li>
+        <li><code>[ingress] mode = "gateway"</code>。</li>
+        <li>签名 URL 还需要配置 <code>[ingress.secure_access]</code>，且至少有一把签名密钥。</li>
+      </ul>
+
+      <h2 id="how-it-works">工作原理</h2>
+      <p><img src="../../public/images/secure-access.svg" alt="Secure Access request flow" /></p>
+
+      <p>在<strong>控制面</strong>，以 <code>secureAccess: true</code> 创建沙箱并调用 <code>GetEndpoint</code>，会得到每个沙箱一份不透明的 <code>SecureAccessToken</code>。若再传入 <code>?expires=&lt;unix_seconds&gt;</code>，还会用 <code>[ingress.secure_access]</code> 下的当前密钥签发有时效的路由令牌。</p>
+
+      <p>在<strong>数据面</strong>，入口网关按固定顺序评估两种机制：</p>
+      <ol>
+        <li><strong>存在请求头</strong> → 与 <code>SecureAccessToken</code> 做常量时间比较。不匹配立即返回 <code>401</code>；<strong>不会</strong>回退到签名 URL 分支。</li>
+        <li><strong>没有请求头</strong> → 解析签名令牌，检查 <code>now ≤ expires</code>，并校验签名。</li>
+      </ol>
+
+      <p>通过任一检查的请求会在转发上游前剥离请求头或签名前缀，因此工作负载永远看不到凭据。</p>
+
+      <h2 id="static-header-token">静态请求头令牌</h2>
+      <p><code>GetEndpoint</code> 返回不透明的 <code>SecureAccessToken</code>。客户端按如下方式附带：</p>
+      <pre><code class="language-http">OpenSandbox-Secure-Access: &lt;token&gt;</code></pre>
+      <p>SDK 会从端点响应中自动带上该请求头，应用代码通常无需手动处理。</p>
+
+      <h2 id="signed-short-lived-urls">签名短时 URL</h2>
+      <p>通过添加 <code>?expires=&lt;unix_seconds&gt;</code>（十进制 <code>uint64</code> 纪元秒，<strong>不是</strong>毫秒）来签发签名 URL：</p>
+      <pre><code>GET /sandboxes/{sandboxId}/endpoints/{port}?expires=&lt;unix_seconds&gt;</code></pre>
+      <p>返回的路由令牌形如：</p>
+      <pre><code>{sandbox_id}-{port}-{expires_b36}-{signature}</code></pre>
+      <p>其中 <code>expires_b36</code> 为 base-36 秒数，<code>signature</code> 为 8 位十六进制加上用于签名的 1 字符 <code>key_id</code>。网关在三种路由模式下均可接受：</p>
+      <table>
+        <thead>
+          <tr><th>模式</th><th>令牌出现位置</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>wildcard</td><td>Host：<code>{token}.&lt;parent&gt;</code></td></tr>
+          <tr><td>header</td><td>沙箱路由请求头的值</td></tr>
+          <tr><td>uri</td><td>路径前缀：<code>/{sandbox_id}/{port}/{expires_b36}/{signature}/…</code></td></tr>
+        </tbody>
+      </table>
+      <p>使用签名 URL 可以下发可分享、有时效的端点，而无需暴露静态令牌。</p>
+
+      <h2 id="server-configuration">服务器配置</h2>
+      <p>签名 URL 需要签名密钥；静态请求头令牌则不需要。</p>
+      <pre><code class="language-toml"># ~/.sandbox.toml
+[ingress]
+mode = "gateway"
+
+[ingress.gateway]
+# Wildcard mode requires a wildcard address (e.g. *.sandbox.example.com);
+# header and uri modes take a plain host (e.g. sandbox.example.com).
+address = "*.sandbox.example.com"
+
+[ingress.gateway.route]
+mode = "wildcard"   # or "header" or "uri"
+
+[ingress.secure_access]
+active_key = "a"    # 1 char [0-9a-z], must exist in keys
+
+[[ingress.secure_access.keys]]
+key_id = "a"
+key = "&lt;base64-encoded-secret&gt;"   # raw base64, no "base64:" prefix
+</code></pre>
+      <p><code>opensandbox-server</code> Helm chart 在 <code>server.gateway.secureAccess</code> 下暴露相同结构，并将密钥同时注入服务器与入口网关。</p>
+      <p>为避免把密钥材料写进配置文件，服务器也接受环境变量 <code>OPENSANDBOX_SECURE_ACCESS_KEYS</code>（<code>a=&lt;base64-secret&gt;[,b=...]</code>）与 <code>OPENSANDBOX_SECURE_ACCESS_ACTIVE_KEY</code>（<code>a</code>），它们会覆盖 TOML 配置块；chart 的 <code>server.gateway.secureAccess.existingSecret</code> 选项可从 Secret 注入这些变量。</p>
+      <p><strong>密钥轮换。</strong>新增密钥条目并部署，再切换 <code>active_key</code>。校验会加载所有已配置密钥，因此旧密钥签发的令牌在你删除它们之前仍有效——请保留旧条目，直到最长可能的令牌有效期结束。</p>
+
+      <h2 id="enabling-it">启用</h2>
+      <p>创建时设置 <code>secureAccess: true</code>。各 SDK 对应写法：Python <code>secure_access=True</code>，JS/TS <code>secureAccess: true</code>，C# <code>SecureAccess = true</code>。</p>
+      <pre><code class="language-bash">curl -X POST http://localhost:8080/v1/sandboxes \
+  -H "Content-Type: application/json" \
+  -d '{
+    "image": {"uri": "python:3.11"},
+    "resourceLimits": {"cpu": "500m", "memory": "512Mi"},
+    "entrypoint": ["python", "/app/main.py"],
+    "secureAccess": true
+  }'
+</code></pre>
+
+      <h2 id="calling-a-secured-endpoint">调用受保护端点</h2>
+      <p>使用静态请求头令牌：</p>
+      <pre><code class="language-bash"># Fetch endpoint; the response carries OpenSandbox-Secure-Access.
+curl -s http://localhost:8080/v1/sandboxes/${SANDBOX_ID}/endpoints/8080
+
+curl -H "OpenSandbox-Secure-Access: ${TOKEN}" \
+  https://${SANDBOX_ID}-8080.sandbox.example.com/
+</code></pre>
+      <p>使用签名 URL（有效期一小时）：</p>
+      <pre><code class="language-bash">EXPIRES=$(( $(date +%s) + 3600 ))
+curl -s "http://localhost:8080/v1/sandboxes/${SANDBOX_ID}/endpoints/8080?expires=${EXPIRES}"
+# → https://{sandbox_id}-8080-{expires_b36}-{signature}.sandbox.example.com/
+</code></pre>
+
+      <h2 id="errors">错误</h2>
+      <table>
+        <thead>
+          <tr><th>状态码</th><th>原因</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>400</code></td>
+            <td>在 Docker 上设置 <code>secureAccess: true</code>；畸形的 <code>expires</code> 或路由令牌；无效的 <code>expires_b36</code> / <code>port</code> / <code>signature</code>。</td>
+          </tr>
+          <tr>
+            <td><code>401</code></td>
+            <td>请求头不匹配；签名 URL 已过期；签名错误；未知的密钥 ID；需要安全访问但未提供凭据。</td>
+          </tr>
+        </tbody>
+      </table>
+      <p>在 <code>GetEndpoint</code> 上省略 <code>expires</code> 并不是 <code>400</code>——它会返回未签名的响应，其中仍携带静态 <code>SecureAccessToken</code>。</p>
+
+      <h2 id="notes">说明</h2>
+      <ul>
+        <li>强制执行覆盖入口网关与服务器代理路径（<code>/v1/sandboxes/{id}/proxy/...</code>），包括 HTTP 与 WebSocket。</li>
+        <li>网关在转发前会剥离 <code>OpenSandbox-Secure-Access</code> 以及任何签名 URI 前缀。</li>
+        <li>在 URI 模式下，仅当沙箱确实启用了安全访问时，形如 <code>expires_b36/signature</code> 的路径段才会被解释为签名前缀；否则完整路径会原样转发。</li>
+        <li>安全访问与 execd 访问令牌（<code>X-EXECD-ACCESS-TOKEN</code>）以及凭证保管库相互独立；三者可一并使用。</li>
+      </ul>
+
+      <h2 id="see-also">另见</h2>
+      <ul>
+        <li><a href="credential-vault.html">凭证保管库</a></li>
+        <li><a href="secure-container.html">安全容器运行时</a></li>
+        <li><a href="../../architecture/network/ingress">Ingress 组件</a></li>
+      </ul>
+
+    </main>
+  </div>
+</body>
+</html>

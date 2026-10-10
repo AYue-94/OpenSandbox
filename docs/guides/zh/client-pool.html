@@ -1,0 +1,556 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>客户端 Pool · OpenSandbox 指南（中文）</title>
+  <meta name="description" content="SDK 侧沙箱池如何工作、如何配置，以及各受支持 SDK 的最小示例。" />
+  <link rel="stylesheet" href="guides-zh.css" />
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <a class="brand" href="index.html">OpenSandbox</a>
+      <div class="brand-sub">功能指南 · 中文版</div>
+      <h2>目录</h2>
+      <nav>
+      <a href="index.html">总览</a>
+      <a href="credential-vault.html">凭证保管库</a>
+      <a href="secure-access.html">安全访问</a>
+      <a href="secure-container.html">安全容器运行时</a>
+      <a href="multi-tenancy.html">多租户</a>
+      <a href="isolation-sessions.html">隔离会话</a>
+      <a href="pause-resume.html">暂停与恢复</a>
+      <a href="qemu-vmstate-snapshots.html">QEMU VMState 快照</a>
+      <a href="egress-sse-truncation.html">Egress SSE 截断</a>
+      <a href="lifecycle-hooks.html">生命周期钩子</a>
+      <a href="windows-sandbox.html">Windows 沙箱</a>
+      <a href="client-pool.html" class="active">客户端 Pool</a>
+      <a href="component-telemetry.html">组件遥测</a>
+      </nav>
+      <p class="note" style="margin-top:1.5rem">由英文 docs/guides/*.md 翻译的静态 HTML，便于本地阅读。</p>
+    </aside>
+    <main class="content">
+      <header class="page-head">
+        <h1>客户端 Pool</h1>
+        <p class="desc">SDK 侧沙箱池如何工作、如何配置，以及各受支持 SDK 的最小示例。</p>
+      </header>
+
+      <p>OpenSandbox SDK 提供实验性的<strong>客户端沙箱池（client-side sandbox pool）</strong>：在服务端预热一小缓冲的就绪沙箱，使 <code>acquire()</code> 能快速返回，而不必在热路径上承担完整的沙箱创建延迟。</p>
+      <p>适用于 Python（async 与 sync）、JavaScript/TypeScript、Kotlin/Java 与 Go。C# 目前尚未提供客户端 pool。</p>
+
+      <div class="callout warning">
+        <span class="label">警告：实验性</span>
+        <p>客户端 pool API 标记为实验性，可能在次要版本之间变更。若在生产中依赖它，请固定 SDK 版本。</p>
+      </div>
+
+      <h2 id="what-it-actually-pools">实际池化的是什么</h2>
+      <p>pool <strong>不会</strong>池化 SDK 的 <code>Sandbox</code> 对象。它池化的是在 OpenSandbox 服务端上<strong>已预热、就绪沙箱的 ID</strong>。</p>
+      <p>适合需要反复获取全新沙箱、对延迟敏感的 worker。pool 保持远端沙箱就绪；它与 HTTP 连接池是分开的。借出的沙箱仍会消耗服务端资源，必须显式清理。</p>
+      <p><img src="../../public/images/client-pool-architecture.svg" alt="客户端 pool 架构" /></p>
+      <p>两条流程并发进行：</p>
+      <ul>
+        <li><strong>Warmup（仅 leader）。</strong>每个节点上都会运行后台 reconcile 循环。持有 primary lock 的节点计算空闲缺口并补齐。Python、JavaScript 与 Kotlin 使用名义上一秒的节奏，并且每个完成的 tick 最多接纳 <code>warmup_create_qps</code> 次新创建。Kotlin 按固定速率调度；若上一次 reconcile 仍在运行，JavaScript 会跳过一个 tick；Python 在上一个 tick 完成后等待一秒。Go 使用可配置的 <code>reconcile_interval</code>，并用 <code>warmup_concurrency</code> 限制每个 tick。成功的 warmup 会独立发布到空闲缓冲，TTL 为 <code>idle_timeout</code>。</li>
+        <li><strong>Acquire（任意节点）。</strong><code>acquire()</code> 从 store 弹出一个空闲 ID，为其连接一个 <code>Sandbox</code> 客户端，可选运行健康检查与到调用方超时的 <code>renew()</code>，然后交给调用方。非 leader 节点可自由 acquire；仅补齐与收缩由 leader lock 门控。</li>
+      </ul>
+      <p>空闲成员关系携带沙箱 ID 及其过期时间，从不携带 HTTP 连接或客户端侧 <code>Sandbox</code> 对象。状态 store 还协调 leader 租约、共享空闲目标与 TTL，以及命名空间销毁围栏（fence）。基于 Redis 的 store 使该协调与空闲成员关系在进程与 Pod 之间可见。</p>
+      <p>warmup 路径——上文仅 leader 的补齐流程——值得放大，因为它是 pool 中唯一由分布式锁门控的部分：</p>
+      <p><img src="../../public/images/client-pool-warmup-sequence.svg" alt="Warmup reconcile 时序" /></p>
+
+      <h3 id="lifecycle-model">生命周期模型</h3>
+      <p>在优雅运行期间，每个 pool 实例经历 <code>NOT_STARTED → STARTING → RUNNING → DRAINING → STOPPED</code>。启动失败或非优雅关闭可直接进入 <code>STOPPED</code>。健康状态单独跟踪为 <code>HEALTHY | DEGRADED | DRAINING | STOPPED</code>；在连续 <code>degraded_threshold</code> 次 warmup 或 reconcile 失败后，pool 进入 <code>DEGRADED</code>。Go 在降级时对补齐应用指数退避。Python、JavaScript 与 Kotlin 继续按名义上一秒的节奏尝试 reconcile：<code>warmup_create_qps</code> 是其压力控制，而 <code>snapshot().backoff_active</code> / <code>snapshot().backoffActive</code> 仅为兼容性保留，且始终为 <code>false</code>。调用方无需直接观察这些状态——<code>snapshot()</code> 为诊断暴露它们。</p>
+      <p>Python、JavaScript 与 Kotlin 的内置 warmup 创建只发起一次生命周期请求。Python 与 Kotlin 对 HTTP 429、其他可重试状态以及传输恢复禁用连接级重试策略；JavaScript 的生命周期传输不会自动重试。没有 pool 级的 <code>Retry-After</code> 节流。自定义 <code>PooledSandboxCreator</code> 通过 <code>PooledSandboxCreateContext.connection_config</code> 或 <code>createConnectionConfig</code> 接收 warmup 连接配置，必须遵守它，并遵守 <code>skipHealthCheck</code>，以保持分阶段行为。失败的创建会被记录，后续 tick 可能接纳替换工作。普通独立创建与 <code>AcquirePolicy.DIRECT_CREATE</code> 保留其通常的传输行为。</p>
+      <p><img src="../../public/images/client-pool-lifecycle.svg" alt="客户端 pool 生命周期状态机" /></p>
+
+      <h3 id="there-is-no-release">没有 <code>release()</code></h3>
+      <p>沙箱是短暂的。一旦调用了 <code>acquire()</code>，沙箱就归你所有，直到你 <code>destroy()</code> / <code>kill()</code> 它。<code>max_idle</code> 约束的是<strong>预热缓冲</strong>，而不是应用代码借出的沙箱数量，也不是 <code>DIRECT_CREATE</code> 回退产生的沙箱数量。</p>
+      <p>在 Python 的 <code>SandboxPoolAsync</code> 中，所有权在 <code>acquire()</code> 返回时转移。若调用在连接或创建沙箱之后失败或取消，pool 会尝试 kill 该沙箱并在传播错误前关闭其本地资源。在续约或最终 pool 状态检查期间取消（包括清理期间的重复取消）不会跳过该清理。一旦获取成功，调用方仍负责处置。</p>
+
+      <h2 id="empty-buffer-behavior-acquirepolicy">空缓冲行为：<code>AcquirePolicy</code></h2>
+      <p>全部四个 pool SDK 都暴露这些策略。Acquire 会消费一个候选；它不会等待未来的 warmup 工作填满空缓冲。</p>
+      <table>
+        <thead>
+          <tr><th>策略</th><th>尝试的空闲候选数</th><th>候选耗尽时</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>FAIL_FAST</code></td>
+            <td>最多一个</td>
+            <td>返回 pool-empty/acquire 错误</td>
+          </tr>
+          <tr>
+            <td><code>DIRECT_CREATE</code>（默认）</td>
+            <td>最多一个</td>
+            <td>创建全新沙箱</td>
+          </tr>
+          <tr>
+            <td><code>RETRY_NEXT_IDLE</code></td>
+            <td>最多 <code>max_acquire_retries</code> 个</td>
+            <td>返回 pool-empty/acquire 错误</td>
+          </tr>
+          <tr>
+            <td><code>RETRY_NEXT_IDLE_THEN_CREATE</code></td>
+            <td>最多 <code>max_acquire_retries</code> 个</td>
+            <td>创建全新沙箱</td>
+          </tr>
+        </tbody>
+      </table>
+      <p><code>max_acquire_retries</code> / <code>maxAcquireRetries</code> / <code>MaxAcquireRetries</code> 默认为 <code>3</code>。它约束的是<strong>候选尝试总数</strong>，而不是第一次之后再额外重试三次。每个候选都可能消耗 acquire 就绪预算；直接创建会增加其自身的启动延迟。</p>
+      <p><code>start()</code> 开始后台补齐，不会等待缓冲填满。启动期间使用 <code>DIRECT_CREATE</code>，或在使用 <code>FAIL_FAST</code> 前观察空闲计数。pool 不是并发上限：直接创建与已借出的沙箱可以超过 <code>max_idle</code>。</p>
+
+      <h2 id="configuration">配置</h2>
+      <p>各 SDK 共享 pool 概念，但调度表面不同。下表是规范参考；确切的 camelCase / snake_case 命名请参阅各语言的 builder 或构造函数。</p>
+      <table>
+        <thead>
+          <tr><th>参数</th><th>Python / JavaScript / Kotlin 默认值</th><th>Go 默认值</th><th>含义</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>pool_name</code></td>
+            <td>必填</td>
+            <td>必填</td>
+            <td>同一分布式 pool 所有节点共享的逻辑命名空间</td>
+          </tr>
+          <tr>
+            <td><code>owner_id</code></td>
+            <td>自动（<code>pool-owner-&lt;uuid&gt;</code>）</td>
+            <td>自动（<code>pool-owner-&lt;host/pid&gt;</code>）</td>
+            <td>本进程作为 primary-lock 所有者的身份；<strong>每个节点必须唯一</strong></td>
+          </tr>
+          <tr>
+            <td><code>max_idle</code></td>
+            <td>必填（≥ 0）</td>
+            <td>必填（≥ 0）</td>
+            <td>空闲缓冲的目标大小与上限</td>
+          </tr>
+          <tr>
+            <td><code>state_store</code></td>
+            <td>Python/Kotlin 必填；JavaScript 默认为内存</td>
+            <td>builder 默认为内存</td>
+            <td><code>InMemoryPoolStateStore</code> 或基于 Redis 的 store</td>
+          </tr>
+          <tr>
+            <td><code>connection_config</code></td>
+            <td>必填</td>
+            <td>必填</td>
+            <td>用于生命周期与 execd 调用</td>
+          </tr>
+          <tr>
+            <td><code>creation_spec</code></td>
+            <td>Python/Kotlin 必填；JavaScript 仅在无 creator 时必填</td>
+            <td>仅在未设置 <code>sandbox_creator</code> 时必填</td>
+            <td>预热沙箱的模板；确切字段因语言而异</td>
+          </tr>
+          <tr>
+            <td><code>sandbox_creator</code></td>
+            <td><code>null</code></td>
+            <td><code>null</code></td>
+            <td>覆盖默认创建的可选回调。Python 与 Kotlin 仍需要 <code>creation_spec</code>；JavaScript 与 Go 允许仅 creator 的 pool。</td>
+          </tr>
+          <tr>
+            <td><code>warmup_create_qps</code></td>
+            <td><code>10</code></td>
+            <td>不可用</td>
+            <td>每个完成的 reconcile tick 最多接纳的 warmup 创建数</td>
+          </tr>
+          <tr>
+            <td><code>warmup_concurrency</code></td>
+            <td><code>128</code></td>
+            <td><code>max(1, ceil(max_idle * 0.2))</code></td>
+            <td>Python / JavaScript / Kotlin：并发的创建后工作；不控制创建接纳。Go：每个 tick 的创建上限与 worker 并发。</td>
+          </tr>
+          <tr>
+            <td><code>primary_lock_ttl</code></td>
+            <td><code>60 s</code></td>
+            <td><code>60 s</code></td>
+            <td>Leader 租约 TTL</td>
+          </tr>
+          <tr>
+            <td><code>reconcile_interval</code></td>
+            <td>名义 <code>1 s</code>，不对外暴露</td>
+            <td><code>30 s</code>，可配置</td>
+            <td>Reconcile 节奏；较长的 Python/JavaScript tick 会降低有效速率</td>
+          </tr>
+          <tr>
+            <td><code>degraded_threshold</code></td>
+            <td><code>3</code></td>
+            <td><code>3</code></td>
+            <td>进入 <code>DEGRADED</code> 前的连续失败次数；仅 Go 会以退避暂停补齐</td>
+          </tr>
+          <tr>
+            <td><code>acquire_ready_timeout</code></td>
+            <td><code>30 s</code></td>
+            <td><code>30 s</code></td>
+            <td>等待返回沙箱就绪的最长时间</td>
+          </tr>
+          <tr>
+            <td><code>acquire_health_check_polling_interval</code></td>
+            <td><code>200 ms</code></td>
+            <td><code>200 ms</code></td>
+            <td>Acquire 期间的就绪轮询间隔</td>
+          </tr>
+          <tr>
+            <td><code>acquire_health_check</code></td>
+            <td><code>null</code></td>
+            <td><code>null</code></td>
+            <td>Acquire 的自定义就绪谓词</td>
+          </tr>
+          <tr>
+            <td><code>acquire_skip_health_check</code></td>
+            <td><code>false</code>；JavaScript 另有每次 acquire 覆盖</td>
+            <td>每次 acquire 选项</td>
+            <td>Acquire 时跳过就绪检查</td>
+          </tr>
+          <tr>
+            <td><code>acquire_min_remaining_ttl</code></td>
+            <td><code>min(60 s, idle_timeout / 2)</code></td>
+            <td><code>min(60 s, idle_timeout / 2)</code></td>
+            <td>Acquire 时丢弃剩余 TTL 短于此值的空闲项</td>
+          </tr>
+          <tr>
+            <td><code>warmup_ready_timeout</code></td>
+            <td><code>30 s</code></td>
+            <td><code>30 s</code></td>
+            <td>预热沙箱就绪检查的最大窗口</td>
+          </tr>
+          <tr>
+            <td><code>warmup_health_check_initial_delay</code></td>
+            <td><code>0 s</code></td>
+            <td>不可用</td>
+            <td>成功创建与首次就绪检查之间的延迟</td>
+          </tr>
+          <tr>
+            <td><code>warmup_health_check_polling_interval</code></td>
+            <td><code>500 ms</code></td>
+            <td><code>200 ms</code></td>
+            <td>Warmup 期间的就绪轮询间隔；Python / JavaScript / Kotlin 也用于 prepare 后检查</td>
+          </tr>
+          <tr>
+            <td><code>warmup_health_check</code></td>
+            <td><code>null</code></td>
+            <td><code>null</code></td>
+            <td>自定义 warmup 就绪谓词</td>
+          </tr>
+          <tr>
+            <td><code>warmup_sandbox_preparer</code></td>
+            <td><code>null</code></td>
+            <td><code>null</code></td>
+            <td>在就绪之后、发布到空闲缓冲之前运行一次</td>
+          </tr>
+          <tr>
+            <td><code>warmup_post_prepare_health_check</code></td>
+            <td><code>null</code></td>
+            <td>不可用</td>
+            <td>preparer 之后的可选校验；重试不会重跑 preparer</td>
+          </tr>
+          <tr>
+            <td><code>warmup_post_prepare_health_check_timeout</code></td>
+            <td><code>30 s</code></td>
+            <td>不可用</td>
+            <td>prepare 后校验的重试窗口</td>
+          </tr>
+          <tr>
+            <td><code>warmup_skip_health_check</code></td>
+            <td><code>false</code></td>
+            <td><code>false</code></td>
+            <td>Warmup 期间跳过 prepare 前的就绪阶段</td>
+          </tr>
+          <tr>
+            <td><code>idle_timeout</code></td>
+            <td><code>24 h</code></td>
+            <td><code>24 h</code></td>
+            <td>pool 创建的沙箱的服务端 TTL</td>
+          </tr>
+          <tr>
+            <td><code>drain_timeout</code></td>
+            <td><code>30 s</code></td>
+            <td><code>30 s</code></td>
+            <td>优雅关闭期间等待进行中操作的最长时间</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3 id="javascript-settings-and-creator-coverage">JavaScript 设置与 creator 覆盖范围</h3>
+      <p>JavaScript 使用上述 Python/JVM 调度默认值：<code>warmupCreateQps: 10</code>、<code>warmupConcurrency: 128</code>、名义上一秒的 reconcile 节奏、500 ms warmup 轮询，以及 30 秒就绪窗口。其 store 默认为 <code>InMemoryPoolStateStore</code>；提供 <code>sandboxCreator</code> 时可省略 <code>creationSpec</code>。时间设置在名称中包含单位，例如 <code>idleTimeoutSeconds</code> 与 <code>warmupHealthCheckInitialDelayMillis</code>。</p>
+      <p>默认 pool creator 暴露的选项少于独立沙箱创建：</p>
+      <table>
+        <thead>
+          <tr><th>创建字段</th><th>Python</th><th>JavaScript</th><th>Kotlin/Java</th><th>Go</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>快照恢复</td><td>否</td><td>是</td><td>否</td><td>是</td></tr>
+          <tr><td>资源配置</td><td>是</td><td>是</td><td>是</td><td>是</td></tr>
+          <tr><td>生命周期钩子</td><td>否</td><td>是</td><td>否</td><td>否</td></tr>
+          <tr><td>Credential Proxy</td><td>否</td><td>是</td><td>是</td><td>是</td></tr>
+        </tbody>
+      </table>
+      <p>全部四个独立沙箱创建 API 都接受这些字段。当默认 pool spec 不足时，使用自定义 <code>sandbox_creator</code> / <code>sandboxCreator</code>，并遵守提供的连接配置、就绪控制与超时。</p>
+      <p>JavaScript 与 Go 还接受每次 acquire 的最小剩余 TTL 与跳过健康检查覆盖。Python 与 Kotlin 将这些作为 pool 级配置暴露。</p>
+
+      <h3 id="staged-warmup">分阶段 Warmup</h3>
+      <p>分阶段 warmup 将创建接纳与创建后工作分开：</p>
+      <p><img src="../../public/images/client-pool-staged-warmup.svg" alt="分阶段 warmup 流程" /></p>
+      <ol>
+        <li>在每个 reconcile tick，leader 最多接纳 <code>min(max_idle - idle - warming, warmup_create_qps)</code> 次创建。生命周期 create 请求只尝试一次，并返回一个不运行其正常内联就绪循环的客户端。创建执行上限是内部的，解析为 <code>ceil(warmup_create_qps * 1.5)</code>，因此缓慢创建不会使活跃创建工作无限增长。自定义 creator 必须遵守其 <code>PooledSandboxCreateContext</code> 提供的 warmup 连接配置与 <code>skipHealthCheck</code>。</li>
+        <li>已创建的沙箱进入延迟阶段队列。首次就绪检查在 <code>warmup_health_check_initial_delay</code> 之后运行；失败按 <code>warmup_health_check_polling_interval</code> 重试，直到 <code>warmup_ready_timeout</code>，包括在截止时间的最后一次检查。</li>
+        <li><code>warmup_sandbox_preparer</code> 运行一次。若已配置，则 <code>warmup_post_prepare_health_check</code> 随后以相同轮询间隔重试，直到 <code>warmup_post_prepare_health_check_timeout</code>；重试从不重跑 preparer。</li>
+        <li>健康的沙箱被续约并提交到空闲缓冲。<code>warmup_concurrency</code> 限制活跃的创建后工作。不成功的就绪轮询之间的延迟不会永久占用全部容量。</li>
+      </ol>
+      <p>Python、JavaScript 或 Kotlin 没有 <code>reconcile_interval</code> 设置，也没有补齐退避。对于使用过旧设置的 Python/Kotlin 配置，请移除 <code>reconcile_interval=...</code> / <code>reconcileInterval(...)</code>，用 <code>warmup_create_qps</code> / <code>warmupCreateQps(...)</code> 控制创建接纳，并用 <code>warmup_concurrency</code> / <code>warmupConcurrency(...)</code> 仅控制创建后容量。</p>
+      <p><code>warmup_create_qps</code> 是接纳上限，而非完成率保证。创建延迟、就绪、准备、状态 store 延迟、事件循环或执行器容量，以及延迟/跳过的 reconcile tick，都可能降低观察到的 warmup 吞吐。</p>
+
+      <h3 id="choosing-a-state-store">选择状态 Store</h3>
+      <ul>
+        <li><strong><code>InMemoryPoolStateStore</code></strong> — 仅单进程。适合开发、测试与单实例 worker。对 gunicorn/uvicorn worker、Celery 或 Kubernetes 副本不是进程级共享。</li>
+        <li><strong>基于 Redis 的 store</strong>（<code>RedisPoolStateStore</code>、<code>AsyncRedisPoolStateStore</code>、JVM 上的 <code>sandbox-pool-redis</code>、Go 中的 <code>poolredis</code>、JavaScript 中的 <code>@alibaba-group/opensandbox/pool-redis</code>）— 多进程或多 Pod 部署必需。同一逻辑 pool 的所有节点必须共享相同的 <code>pool_name</code> 与 Redis <code>key_prefix</code>，且每个进程必须使用<strong>唯一</strong>的 <code>owner_id</code>。</li>
+      </ul>
+      <p><img src="../../public/images/client-pool-topology.svg" alt="单节点与分布式 pool 拓扑" /></p>
+
+      <h3 id="rules-that-apply-to-every-deployment">适用于每次部署的规则</h3>
+      <ul>
+        <li><code>max_idle</code> 仅约束预热缓冲。它不限制借出的沙箱或 <code>DIRECT_CREATE</code> 回退。</li>
+        <li>共享同一 pool 的所有节点必须使用相同的创建与 warmup 定义。若该定义变更，请在<strong>新的</strong> <code>pool_name</code>（或 Redis <code>key_prefix</code>）下滚动发布，并退役旧的（见下文「退役旧的 pool 命名空间」）。不要试图把变更后的模板重新填入同一 <code>pool_name</code>：<code>release_all_idle()</code> 不会围栏其他节点、不会降低 <code>max_idle</code>，也不会阻止任何当前 leader（可能仍在运行旧代码）在滚动部署期间立即把旧模板沙箱 ID 重新发布到共享缓冲。</li>
+        <li><code>resize(max_idle)</code> 与 <code>release_all_idle()</code> 可从任意节点调用。</li>
+        <li>将 <code>primary_lock_ttl</code> 配置为高于 <code>warmup_ready_timeout</code> 加上预期 preparer 时间与运维余量。SDK 会独立续约领导权并为每次提交设围栏，但丢失租约会导致进行中的 warmup 被丢弃而非发布。</li>
+      </ul>
+
+      <h2 id="minimal-usage">最小用法</h2>
+
+      <h3 id="python-sync">Python（sync）</h3>
+<pre><code>from datetime import timedelta
+
+from opensandbox import (
+    AcquirePolicy,
+    InMemoryPoolStateStore,
+    PoolCreationSpec,
+    SandboxPoolSync,
+)
+from opensandbox.config import ConnectionConfigSync
+
+pool = SandboxPoolSync(
+    pool_name="demo-pool",
+    owner_id="worker-1",
+    max_idle=2,
+    state_store=InMemoryPoolStateStore(),
+    connection_config=ConnectionConfigSync(domain="api.opensandbox.io"),
+    creation_spec=PoolCreationSpec(image="ubuntu:22.04"),
+    warmup_create_qps=10,
+    warmup_concurrency=128,
+)
+
+pool.start()
+try:
+    sandbox = pool.acquire(
+        sandbox_timeout=timedelta(minutes=30),
+        policy=AcquirePolicy.DIRECT_CREATE,
+    )
+    try:
+        result = sandbox.commands.run("echo pool-ok")
+        print(result.logs.stdout[0].text)
+    finally:
+        sandbox.destroy()
+finally:
+    pool.shutdown(graceful=True)</code></pre>
+
+      <h3 id="python-asyncio">Python（asyncio）</h3>
+      <p><code>SandboxPoolAsync</code> 具有相同表面，外加 <code>async with</code> 上下文管理器：</p>
+<pre><code>from datetime import timedelta
+
+from opensandbox import (
+    AcquirePolicy,
+    InMemoryAsyncPoolStateStore,
+    PoolCreationSpec,
+    SandboxPoolAsync,
+)
+from opensandbox.config import ConnectionConfig
+
+async with SandboxPoolAsync(
+    pool_name="demo-pool",
+    owner_id="worker-1",
+    max_idle=2,
+    state_store=InMemoryAsyncPoolStateStore(),
+    connection_config=ConnectionConfig(domain="api.opensandbox.io"),
+    creation_spec=PoolCreationSpec(image="ubuntu:22.04"),
+) as pool:
+    sandbox = await pool.acquire(
+        sandbox_timeout=timedelta(minutes=30),
+        policy=AcquirePolicy.DIRECT_CREATE,
+    )
+    try:
+        result = await sandbox.commands.run("echo pool-ok")
+    finally:
+        await sandbox.destroy()</code></pre>
+
+      <h3 id="kotlin-java">Kotlin / Java</h3>
+<pre><code>SandboxPool pool = SandboxPool.builder()
+    .poolName("demo-pool")
+    .ownerId("worker-1")
+    .maxIdle(3)
+    .stateStore(new InMemoryPoolStateStore())
+    .connectionConfig(config)
+    .creationSpec(PoolCreationSpec.builder()
+        .image("ubuntu:22.04")
+        .entrypoint(List.of("tail", "-f", "/dev/null"))
+        .build())
+    .warmupReadyTimeout(Duration.ofSeconds(45))
+    .build();
+
+pool.start();
+try {
+    Sandbox sb = pool.acquire(Duration.ofMinutes(10), AcquirePolicy.DIRECT_CREATE);
+    try {
+        sb.commands().run("echo pool-ok");
+    } finally {
+        try {
+            sb.kill();
+        } finally {
+            sb.close();
+        }
+    }
+} finally {
+    pool.shutdown(true);
+}</code></pre>
+
+      <h3 id="go">Go</h3>
+      <p>在返回 <code>error</code> 的函数内，配合 <code>ctx</code> 以及通常的 <code>context</code>、<code>fmt</code>、<code>time</code> 与 <code>opensandbox</code> 导入：</p>
+<pre><code>pool, err := opensandbox.NewSandboxPoolBuilder().
+    PoolName("demo-pool").
+    OwnerID("worker-1").
+    MaxIdle(3).
+    ConnectionConfig(opensandbox.ConnectionConfig{Domain: "api.opensandbox.io"}).
+    CreationSpec(opensandbox.PoolCreationSpec{Image: "ubuntu:22.04"}).
+    StateStore(opensandbox.NewInMemoryPoolStateStore()).
+    Build()
+if err != nil {
+    return err
+}
+if err := pool.Start(ctx); err != nil {
+    return err
+}
+defer pool.Shutdown(context.Background(), true)
+
+policy := opensandbox.AcquirePolicyDirectCreate
+sb, err := pool.Acquire(ctx, opensandbox.AcquireOptions{
+    SandboxTimeout: 10 * time.Minute,
+    Policy:         &amp;policy,
+})
+if err != nil {
+    return err
+}
+defer sb.Close()
+defer sb.Kill(context.Background())
+
+result, err := sb.RunCommand(ctx, "echo pool-ok", nil)
+if err != nil {
+    return err
+}
+fmt.Println(result.Logs.Stdout)
+return nil</code></pre>
+
+      <h3 id="javascript-typescript">JavaScript / TypeScript</h3>
+<pre><code>import { AcquirePolicy, SandboxPool } from "@alibaba-group/opensandbox";
+
+const pool = SandboxPool.create({
+  poolName: "demo-pool",
+  maxIdle: 2,
+  connectionConfig: { domain: "localhost:8080", useServerProxy: true },
+  creationSpec: { image: "python:3.12" },
+  warmupCreateQps: 10,
+  warmupConcurrency: 128,
+});
+
+await pool.start();
+try {
+  const sandbox = await pool.acquire({
+    sandboxTimeoutSeconds: 600,
+    policy: AcquirePolicy.DIRECT_CREATE,
+  });
+  try {
+    const result = await sandbox.commands.run("echo pool-ok");
+    console.log(result.logs.stdout);
+  } finally {
+    try {
+      await sandbox.kill();
+    } finally {
+      await sandbox.close();
+    }
+  }
+} finally {
+  await pool.shutdown(true);
+}</code></pre>
+      <p>要跨进程共享状态，请安装 <code>redis</code>，在应用中连接它，并将该 store 作为 <code>stateStore</code> 传入：</p>
+<pre><code>import { createClient } from "redis";
+import { RedisPoolStateStore } from "@alibaba-group/opensandbox/pool-redis";
+
+const redis = createClient({ url: process.env.REDIS_URL });
+await redis.connect();
+const stateStore = new RedisPoolStateStore({
+  client: redis,
+  keyPrefix: "opensandbox:pool:prod",
+});
+// Pass stateStore to SandboxPool.create(...).
+// After all pools/managers using it are shut down:
+// await redis.quit();</code></pre>
+      <p>调用方拥有 Redis 连接。自定义 JavaScript preparer 与健康检查必须自行约束其工作：取消可以停止等待回调，而不停止回调本身。</p>
+
+      <h2 id="diagnostics-and-operations">诊断与运维</h2>
+      <p>每个 pool SDK 暴露这些操作（名称遵循语言约定）：</p>
+      <ul>
+        <li><code>snapshot()</code> — pool 阶段、健康状态、计数器（空闲大小、进行中 warmup、连续失败、最后错误）。</li>
+        <li><code>snapshot_idle_entries()</code> — 当前空闲沙箱 ID 及其过期时间戳。</li>
+        <li><code>resize(max_idle)</code> — 在运行时更改目标缓冲大小。</li>
+        <li><code>release_all_idle()</code> — 排空当前可见的空闲缓冲并尽力 kill 每一项，而不停止 pool。适用于在短暂上游问题后强制一批新的 warmup。它<strong>不会</strong>更改 <code>max_idle</code>，<strong>不会</strong>围栏其他节点，也<strong>不会</strong>阻止活跃 leader 立即补齐——因此它不是在同一 <code>pool_name</code> 上交换创建模板的安全方式。对于那种情况，请在新的 <code>pool_name</code> 下退役整个命名空间（见下文）。</li>
+      </ul>
+      <p>现有清理方法保留其原始执行行为。若需可选的有界并行清理，请使用 Python 的 <code>release_all_idle_parallel(max_workers=50)</code>、Kotlin 的 <code>releaseAllIdle(concurrency)</code>、JavaScript 的 <code>releaseAllIdle(concurrency)</code>，或 Go 的具体方法 <code>(*DefaultSandboxPool).ReleaseAllIdleParallel(ctx, maxWorkers)</code>。这些方法会校验正的并发值，并等待每个已排空的 ID 收到尽力 kill 尝试。Go 方法有意放在 <code>SandboxPool</code> 接口之外，以保持与第三方实现者的兼容性。</p>
+
+      <h3 id="tracing-warmups">追踪 Warmup</h3>
+      <p>Python、JavaScript 与 Kotlin/Java 发出可选的 OpenTelemetry warmup span。在 Python 中设置 <code>enable_tracing=True</code>，或在 JavaScript/JVM 连接配置中设置 <code>enableTracing: true</code> / <code>.enableTracing(true)</code>。应用提供其 OpenTelemetry provider 与 exporter。阶段名称与语言特定属性参见 <a href="/sdks/observability#pool-warmup-tracing">SDK Tracing</a>。</p>
+      <p>Pool <code>shutdown</code> 停止该本地 pool 实例；它不会终止已交给调用方的沙箱。要退役共享命名空间，请使用下方的 manager。</p>
+
+      <h3 id="retiring-an-old-pool-namespace">退役旧的 Pool 命名空间</h3>
+      <p>每个受支持的 pool SDK 都暴露带有 <code>destroy</code> 操作的 <code>SandboxPoolManager</code>，应用相同的 <code>DESTROYING → DESTROYED</code> 协议：</p>
+      <ol>
+        <li>向状态 store 写入 <code>DESTROYING</code> 围栏，使任何仍在运行的对等实例看到它并停止补齐，而不是与退役竞争。</li>
+        <li>尽力排空并 kill 每个空闲沙箱，受 drain 超时约束。</li>
+        <li>清除持久的每 pool 状态。</li>
+        <li>写入带 tombstone TTL（默认 7 天）的 <code>DESTROYED</code> 墓碑，使未来调用方不能静默重新绑定到同一 <code>pool_name</code>。</li>
+      </ol>
+      <p>Destroy 是幂等的：在已墓碑化的命名空间上调用它会报告 <code>DESTROYED</code>，而不会排空或 kill 任何内容。若 drain 或清理无法完成，命名空间保持 <code>DESTROYING</code>，调用报告 destroy 未完成；重试是安全的，会从中断处继续。</p>
+      <p><strong>Python / Kotlin</strong> — <code>SandboxPoolManager.destroy(poolName, options)</code>，通过 <code>PoolDestroyOptions</code>（<code>strategy</code>、<code>drain_timeout</code>、<code>tombstone_ttl</code>）配置。</p>
+      <p><strong>JavaScript</strong> — <code>SandboxPoolManager.create({ stateStore, connectionConfig })</code>，然后 <code>await manager.destroy(poolName, options)</code>。</p>
+      <p><strong>Go</strong> — <code>(*SandboxPoolManager).Destroy(ctx, poolName, options)</code>：</p>
+<pre><code>manager, err := opensandbox.NewSandboxPoolManagerBuilder().
+    StateStore(store).
+    ConnectionConfig(connCfg).
+    Build()
+if err != nil {
+    return err
+}
+
+result, err := manager.Destroy(ctx, "orders-v2", opensandbox.PoolDestroyOptions{})
+if err != nil {
+    return err
+}
+log.Printf("retired %s: drained=%d killed=%d",
+    result.PoolName, result.DrainedIdleCount, result.KilledIdleCount)</code></pre>
+      <p><code>PoolDestroyOptions</code> 与其他 SDK 镜像对应。<code>Strategy</code> 选择算法，目前仅实现 <code>PoolDestroyForce</code>。<code>DrainTimeout</code> 与 <code>TombstoneTTL</code> 是 <code>*time.Duration</code>：保持为 nil 使用默认值（30s 与 7 天），或设置显式零值以在无截止时间的情况下 drain，并写入永不过期的墓碑。</p>
+      <p>围栏使退役在不必先停止每个写入者的情况下保持安全，并在两个层面强制执行。状态 store 会以 <code>*PoolDestroyedError</code> 拒绝 <code>PutIdle</code>、<code>SetMaxIdle</code> 与 <code>SetIdleEntryTTL</code>，且不发放 primary lock，从而停止补齐。pool 本身也会在启动时、每次 acquire 之前、acquire 持有存活沙箱之后，以及每个 reconcile tick 上检查围栏：幸存的对等方在下一个 tick 上直接停止；进行中的 acquire 会失败，而不是通过 direct-create 回退向已退役命名空间铸造新沙箱；在围栏落地前刚取得的沙箱会被 kill 而不是交出。acquire 后检查很重要，因为空闲取出有意不设围栏，以便 <code>destroy</code> 可以排空：一旦 ID 被取出，<code>destroy</code> 无法再触及它，因此 acquire 必须自行处置。针对已墓碑化的 <code>PoolName</code> 启动新 pool 会因同样原因失败，因此重新绑定该名称需要等待墓碑 TTL 过期，或轮换到新的 <code>PoolName</code>。</p>
+      <p>一个有意的例外：若状态 store 本身不可达，destroy 状态不可知，因此已在 store 故障时回退到直接创建的策略（<code>DIRECT_CREATE</code>、<code>RETRY_NEXT_IDLE_THEN_CREATE</code>）会假定 <code>ACTIVE</code> 并继续，与现有的 <code>try_take_idle</code> 故障行为一致。<code>FAIL_FAST</code> 与 <code>RETRY_NEXT_IDLE</code> 则暴露故障。该放宽止于已从空闲缓冲取出的沙箱：那里的检查是失败关闭的，不可达 store 意味着沙箱被 kill，因为没有其他东西再跟踪它。</p>
+
+      <h2 id="further-reading">延伸阅读</h2>
+      <ul>
+        <li>Python：<a href="/sdks/python"><code>/sdks/python</code></a> — <code>SandboxPoolSync</code>、<code>SandboxPoolAsync</code>、Redis store。</li>
+        <li>JavaScript：<a href="/sdks/javascript">SDK 入口</a> — <code>SandboxPool</code> 与 <code>/pool-redis</code> 导出。</li>
+        <li>Kotlin：<a href="/sdks/kotlin"><code>/sdks/kotlin</code></a> — <code>SandboxPool</code> builder、<code>sandbox-pool-redis</code> 模块。</li>
+        <li>Go：<a href="/sdks/go"><code>/sdks/go</code></a> — <code>SandboxPool</code> 接口、<code>RedisPoolStateStore</code>、分布式部署说明。</li>
+      </ul>
+
+      <div class="footer-nav">
+        <a href="windows-sandbox.html">← Windows 沙箱</a>
+        <a href="component-telemetry.html">组件遥测 →</a>
+      </div>
+
+    </main>
+  </div>
+</body>
+</html>

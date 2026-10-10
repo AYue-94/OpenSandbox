@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>多租户 · OpenSandbox 指南（中文）</title>
+  <meta name="description" content="通过按租户 API 密钥与自动命名空间路由，在 Kubernetes 命名空间间隔离沙箱工作负载。" />
+  <link rel="stylesheet" href="guides-zh.css" />
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <a class="brand" href="index.html">OpenSandbox</a>
+      <div class="brand-sub">功能指南 · 中文版</div>
+      <h2>目录</h2>
+      <nav>
+      <a href="index.html">总览</a>
+      <a href="credential-vault.html">凭证保管库</a>
+      <a href="secure-access.html">安全访问</a>
+      <a href="secure-container.html">安全容器运行时</a>
+      <a href="multi-tenancy.html" class="active">多租户</a>
+      <a href="isolation-sessions.html">隔离会话</a>
+      <a href="pause-resume.html">暂停与恢复</a>
+      <a href="qemu-vmstate-snapshots.html">QEMU VMState 快照</a>
+      <a href="egress-sse-truncation.html">Egress SSE 截断</a>
+      <a href="lifecycle-hooks.html">生命周期钩子</a>
+      <a href="windows-sandbox.html">Windows 沙箱</a>
+      <a href="client-pool.html">客户端 Pool</a>
+      <a href="component-telemetry.html">组件遥测</a>
+      </nav>
+      <p class="note" style="margin-top:1.5rem">由英文 docs/guides/*.md 翻译的静态 HTML，便于本地阅读。</p>
+    </aside>
+    <main class="content">
+      <header class="page-head">
+        <h1>多租户</h1>
+        <p class="desc">通过按租户 API 密钥与自动命名空间路由，在 Kubernetes 命名空间间隔离沙箱工作负载。</p>
+      </header>
+
+      <p>多租户使单次 OpenSandbox Server 部署能够服务多个独立消费者，每个消费者隔离在各自的 Kubernetes 命名空间中。每个租户获得专用 API 密钥，所有沙箱生命周期操作（创建、列表、获取、删除）都会自动限定在该租户的命名空间内。</p>
+
+      <h2 id="requirements">要求</h2>
+      <ul>
+        <li><code>opensandbox-server</code> &gt;= 0.2.2</li>
+        <li>Kubernetes 运行时（在 <code>server.toml</code> 中 <code>runtime.type = "kubernetes"</code>）</li>
+        <li>每个租户一个 Kubernetes 命名空间，由<strong>集群管理员预先创建</strong></li>
+        <li>默认 Helm chart RBAC（已包含具备跨命名空间访问能力的 ClusterRole）</li>
+      </ul>
+
+      <div class="callout tip">
+        <span class="label">提示</span>
+        <p><strong>多租户模式下的代理路由</strong><br />
+        与单租户模式不同，启用多租户后代理路由需要 <code>OPEN-SANDBOX-API-KEY</code>。请确保客户端在代理请求中携带该请求头。</p>
+      </div>
+
+      <div class="callout warning">
+        <span class="label">警告</span>
+        <p><strong>不支持 Docker</strong><br />
+        多租户依赖 Kubernetes 命名空间隔离。若配置了 <code>runtime.type = "docker"</code> 同时又启用了租户，服务器会以致命错误拒绝启动。</p>
+      </div>
+
+      <h2 id="how-it-works">工作原理</h2>
+      <pre><code>Request with OPEN-SANDBOX-API-KEY header
+       │
+       ├── Tenant provider configured?
+       │       ├── YES → lookup key in tenant provider
+       │       │       ├── found  → inject tenant context, route to tenant namespace
+       │       │       └── not found → 401 Unauthorized
+       │       └── NO  → validate against server.api_key (single-tenant legacy)
+</code></pre>
+
+      <p>多租户生效时：</p>
+      <ol>
+        <li>鉴权中间件通过已配置的 provider 将 API 密钥解析为 <code>TenantEntry</code>。</li>
+        <li>租户的命名空间被注入到请求作用域的 <code>ContextVar</code>。</li>
+        <li>沙箱生命周期操作（create/list/get/delete）使用解析得到的命名空间。</li>
+        <li>列表操作只返回已认证租户命名空间内的沙箱。</li>
+        <li>在多租户模式下，代理路由（<code>/sandboxes/{id}/proxy/...</code>）也需要 <code>OPEN-SANDBOX-API-KEY</code>。</li>
+      </ol>
+
+      <h2 id="configuration">配置</h2>
+      <p>在 <code>server.toml</code> 中添加 <code>[tenants]</code> 段即可启用多租户。提供两种 provider 后端：<strong>file</strong>（本地 TOML）与 <strong>http</strong>（远程端点）。</p>
+
+      <h3 id="file-provider-default">File Provider（默认）</h3>
+      <p>在 <code>server.toml</code> 中添加：</p>
+      <pre><code class="language-toml">[tenants]
+provider = "file"
+</code></pre>
+      <p>然后在以下路径之一创建 <code>tenants.toml</code>（按顺序检查）：</p>
+      <ol>
+        <li><code>$SANDBOX_TENANTS_CONFIG_PATH</code> 环境变量</li>
+        <li><code>~/.opensandbox/tenants.toml</code></li>
+      </ol>
+      <p>示例 <code>tenants.toml</code>：</p>
+      <pre><code class="language-toml">[[tenants]]
+name = "team-alpha"
+namespace = "sandbox-alpha"
+api_keys = ["sk-alpha-key-1", "sk-alpha-key-2"]
+
+[[tenants]]
+name = "team-beta"
+namespace = "sandbox-beta"
+api_keys = ["sk-beta-key-1"]
+</code></pre>
+      <p>每个租户条目需要：</p>
+      <table>
+        <thead>
+          <tr><th>字段</th><th>说明</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>name</code></td><td>唯一的可读租户标识</td></tr>
+          <tr><td><code>namespace</code></td><td>目标 Kubernetes 命名空间（服务器启动时必须已存在）</td></tr>
+          <tr><td><code>api_keys</code></td><td>该租户的一个或多个 API 密钥（支持密钥轮换）</td></tr>
+        </tbody>
+      </table>
+      <p>约束：</p>
+      <ul>
+        <li>API 密钥在所有租户间必须唯一（重复 → 启动错误）。</li>
+        <li>每个租户至少要有一把密钥。</li>
+        <li>使用 <code>[tenants]</code> 时必须从 <code>server.toml</code> 中移除 <code>server.api_key</code>。</li>
+      </ul>
+
+      <h3 id="http-provider">HTTP Provider</h3>
+      <p>适用于由外部 IAM 或租户管理系统管理租户的环境：</p>
+      <pre><code class="language-toml">[tenants]
+provider = "http"
+endpoint = "https://iam.internal/opensandbox/tenant-lookup"
+max_stale_seconds = 300.0
+timeout_seconds = 5.0
+auth_header = "X-Internal-Auth"
+auth_token = "bearer-token-here"
+</code></pre>
+      <table>
+        <thead>
+          <tr><th>字段</th><th>默认值</th><th>说明</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>provider</code></td><td><code>"file"</code></td><td><code>"file"</code> 或 <code>"http"</code></td></tr>
+          <tr><td><code>endpoint</code></td><td>—</td><td>HTTP 必需。服务器用 GET 解析密钥的 URL。</td></tr>
+          <tr><td><code>max_stale_seconds</code></td><td><code>300.0</code></td><td>端点不可达时，最多用陈旧缓存服务多少秒。</td></tr>
+          <tr><td><code>timeout_seconds</code></td><td><code>5.0</code></td><td>HTTP 请求超时。</td></tr>
+          <tr><td><code>auth_header</code></td><td>—</td><td>可选的 provider 级鉴权请求头名称。</td></tr>
+          <tr><td><code>auth_token</code></td><td>—</td><td>该请求头的可选令牌值。</td></tr>
+        </tbody>
+      </table>
+
+      <p><strong>HTTP 端点约定：</strong></p>
+      <p>请求：</p>
+      <pre><code>GET {endpoint}
+Header: OPEN-SANDBOX-API-KEY: &lt;api_key&gt;
+</code></pre>
+      <p>响应（200）：</p>
+      <pre><code class="language-json">{
+  "namespace": "sandbox-alpha",
+  "ttl": 60
+}
+</code></pre>
+      <p>响应（401）：</p>
+      <pre><code class="language-json">{
+  "code": "UNAUTHORIZED",
+  "message": "Invalid API key"
+}
+</code></pre>
+      <p>HTTP provider 按密钥缓存结果，并使用服务器建议的 <code>ttl</code>。TTL 到期后同步重新拉取。若端点不可达，陈旧条目最多服务到 <code>max_stale_seconds</code>，之后请求以 503 失败。</p>
+
+      <div class="callout warning">
+        <span class="label">警告</span>
+        <p><strong>HTTP provider 跳过启动时命名空间校验</strong><br />
+        HTTP provider 按 API 密钥解析租户，无法在启动时枚举全部租户，因此会跳过 fail-fast 命名空间检查（改为记录警告）。file provider 会在启动时加载完整 <code>tenants.toml</code>，任何租户命名空间缺失或不可访问仍会 fail-fast。使用 HTTP provider 时，请在签发租户 API 密钥前确保命名空间存在且可访问。</p>
+      </div>
+
+      <h2 id="namespace-setup">命名空间准备</h2>
+      <p>接入租户之前，集群管理员必须准备好目标命名空间。</p>
+
+      <h3 id="1-create-namespace">1. 创建命名空间</h3>
+      <pre><code class="language-bash">kubectl create namespace sandbox-alpha
+</code></pre>
+
+      <h3 id="2-resourcequota-recommended">2. ResourceQuota（推荐）</h3>
+      <pre><code class="language-yaml">apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: tenant-quota
+  namespace: sandbox-alpha
+spec:
+  hard:
+    requests.cpu: "8"
+    requests.memory: 16Gi
+    limits.cpu: "16"
+    limits.memory: 32Gi
+    pods: "20"
+</code></pre>
+
+      <h4 id="quota-exhaustion-behavior">配额耗尽行为</h4>
+      <p>当命名空间配额耗尽时，<code>POST /v1/sandboxes</code> 会快速失败并返回 <code>403 KUBERNETES::QUOTA_EXCEEDED</code>，而不是等待沙箱创建超时后返回 <code>KUBERNETES::POD_READY_TIMEOUT</code>：</p>
+      <ul>
+        <li><strong>计数配额</strong>（<code>count/sandboxes.agents.x-k8s.io</code>）：Kubernetes 准入会立即拒绝创建 Sandbox。</li>
+        <li><strong>计算配额</strong>（<code>requests.cpu</code>、<code>requests.memory</code>、<code>pods</code>）：Sandbox 会被创建，但其 Pod 无法准入；一旦控制器记录到工作负载状态中的拒绝（<code>ReconcilerError</code>），服务器会尽快暴露该结果（通常在一秒内）。</li>
+      </ul>
+      <p>响应体使用标准 <code>ErrorResponse</code> 形状，<code>message</code> 携带 Kubernetes 准入细节，例如 <code>exceeded quota: tenant-quota, requested: requests.cpu=1, used: requests.cpu=8, limited: requests.cpu=8</code>。SDK 客户端会将其呈现为 HTTP 状态 403 的类型化错误。提高配额或释放容量后重试即可——无需重启服务器。</p>
+      <p>该 fail-fast 约定目前适用于 <code>agent-sandbox</code> 工作负载供应商（<code>[kubernetes] workload_provider = "agent-sandbox"</code>）。在默认的 <code>batchsandbox</code> 供应商下，控制器尚未把准入拒绝传播到 CR 状态，因此配额耗尽仍会等待沙箱创建超时并返回 <code>KUBERNETES::POD_READY_TIMEOUT</code>。</p>
+
+      <h3 id="3-limitrange-recommended">3. LimitRange（推荐）</h3>
+      <pre><code class="language-yaml">apiVersion: v1
+kind: LimitRange
+metadata:
+  name: tenant-limits
+  namespace: sandbox-alpha
+spec:
+  limits:
+  - default:
+      cpu: "1"
+      memory: 2Gi
+    defaultRequest:
+      cpu: 250m
+      memory: 512Mi
+    type: Container
+</code></pre>
+      <p><code>Container</code> 默认值会作用于每个省略对应资源设置的容器，包括 OpenSandbox egress sidecar。请在生命周期服务器中为 sidecar 配置更小的专用值，以免 egress 容器继承为沙箱工作负载准备的默认值。</p>
+
+      <h3 id="4-egress-sidecar-resources-recommended">4. Egress sidecar 资源（推荐）</h3>
+      <p>在服务器的 <code>[egress]</code> 配置中加入 Kubernetes 资源设置：</p>
+      <pre><code class="language-toml">[egress]
+image = "opensandbox/egress:v1.1.7"
+requests = { cpu = "25m", memory = "64Mi" }
+limits = { cpu = "250m", memory = "256Mi" }
+</code></pre>
+      <p>requests 与 limits 可独立配置。这些值是基础 DNS/nft 强制执行的起点；请对工作负载做基准测试，在使用凭证保管库或透明 mitmproxy 时留出更多余量。若你的 <code>LimitRange</code> 定义了最小值，egress 设置必须满足它们。</p>
+
+      <h3 id="5-server-rbac">5. 服务器 RBAC</h3>
+      <p>默认 Helm chart（<code>opensandbox-server</code>）已部署带跨命名空间访问能力的 ClusterRole + ClusterRoleBinding。多租户无需额外 RBAC 变更——服务器 ServiceAccount 已可在任意命名空间中操作。</p>
+
+      <h2 id="hot-reload">热重载</h2>
+
+      <h3 id="file-provider">File provider</h3>
+      <p>file provider 监视 <code>tenants.toml</code> 的变更（每 2 秒轮询）。变更无需重启服务器即可生效：</p>
+      <ul>
+        <li><strong>新增密钥</strong> → 下一个请求立即有效。</li>
+        <li><strong>移除密钥</strong> → 立即无效（401）。</li>
+        <li><strong>重载时解析错误</strong> → 保留上一份配置，并记录警告。</li>
+        <li><strong>文件被删除</strong> → 所有租户密钥失效。</li>
+      </ul>
+      <p>监视器会监听父目录，以处理 Kubernetes ConfigMap 的原子符号链接替换。</p>
+
+      <h3 id="http-provider-reload">HTTP provider</h3>
+      <p>无需显式重载——缓存条目按各自 <code>ttl</code> 过期，并在下次查找时重新拉取。</p>
+
+      <h2 id="key-rotation">密钥轮换</h2>
+      <p>多租户特意支持每个租户多把 API 密钥，以实现零停机密钥轮换：</p>
+      <ol>
+        <li>将新密钥加入 <code>tenants.toml</code>（或通过 HTTP provider 签发）。</li>
+        <li>等待热重载（file）或 TTL 过期（HTTP）。</li>
+        <li>将客户端更新为使用新密钥。</li>
+        <li>从配置中移除旧密钥。</li>
+      </ol>
+      <p>过渡窗口内新旧密钥同时有效。</p>
+
+      <h2 id="migration-from-single-tenant">从单租户迁移</h2>
+      <ol>
+        <li>为租户创建目标命名空间。</li>
+        <li>编写 <code>tenants.toml</code>，将现有 API 密钥作为租户条目，指向现有命名空间：
+          <pre><code class="language-toml">[[tenants]]
+name = "default"
+namespace = "your-existing-namespace"
+api_keys = ["your-existing-api-key"]
+</code></pre>
+        </li>
+        <li>在 <code>server.toml</code> 中添加 <code>[tenants]</code> 段：
+          <pre><code class="language-toml">[tenants]
+provider = "file"
+</code></pre>
+        </li>
+        <li>从 <code>server.toml</code> 的 <code>[server]</code> 中移除 <code>api_key</code>。</li>
+        <li>部署。现有密钥继续可用，现已成为租户密钥。</li>
+        <li>按需添加更多租户。</li>
+      </ol>
+      <p><strong>回滚：</strong>从 <code>server.toml</code> 移除 <code>[tenants]</code> 段，恢复 <code>server.api_key</code>，然后重启。</p>
+
+      <h2 id="isolation-model">隔离模型</h2>
+      <p>服务器本身不强制资源配额或网络策略。隔离委托给 Kubernetes：</p>
+      <table>
+        <thead>
+          <tr><th>维度</th><th>Kubernetes 机制</th><th>范围</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Resource quota</td><td><code>ResourceQuota</code></td><td>按命名空间的 CPU、内存、存储</td></tr>
+          <tr><td>Default limits</td><td><code>LimitRange</code></td><td>按命名空间的默认容器资源</td></tr>
+          <tr><td>Network isolation</td><td>Egress sidecar</td><td>通过 egress 代理实现按沙箱的出站策略</td></tr>
+          <tr><td>Sandbox count</td><td><code>ResourceQuota</code>（pod count）</td><td>按命名空间的 Pod 上限</td></tr>
+          <tr><td>RBAC</td><td><code>RoleBinding</code></td><td>按命名空间的 API 访问</td></tr>
+        </tbody>
+      </table>
+
+      <div class="callout info">
+        <span class="label">说明</span>
+        <p><strong>Pool API 不按租户隔离</strong><br />
+        Pool 管理路由（<code>/pools</code>）当前在服务器配置的默认命名空间中操作，而不是已认证租户的命名空间。Pool 是共享资源。若需要按租户隔离 Pool，请创建独立的服务器部署，或等待未来的按租户 Pool 支持。</p>
+      </div>
+
+      <h2 id="troubleshooting">故障排查</h2>
+      <table>
+        <thead>
+          <tr><th>现象</th><th>原因</th><th>处理</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>服务器启动退出："Multi-tenancy requires Kubernetes namespaces"</td>
+            <td>配置了 <code>runtime.type = "docker"</code> 与 <code>[tenants]</code></td>
+            <td>改用 Kubernetes 运行时，或移除 <code>[tenants]</code></td>
+          </tr>
+          <tr>
+            <td>服务器退出："Remove server.api_key from server.toml"</td>
+            <td>同时存在 <code>server.api_key</code> 与 <code>[tenants]</code></td>
+            <td>从 <code>[server]</code> 段移除 <code>api_key</code></td>
+          </tr>
+          <tr>
+            <td>服务器退出：namespace not found</td>
+            <td>租户命名空间不存在</td>
+            <td>启动服务器前执行 <code>kubectl create namespace &lt;ns&gt;</code></td>
+          </tr>
+          <tr>
+            <td>配置变更后有效密钥仍 401</td>
+            <td>热重载尚未生效</td>
+            <td>等待 2s（file）或 TTL 秒数（HTTP）</td>
+          </tr>
+          <tr>
+            <td>503 TENANT_PROVIDER_UNAVAILABLE</td>
+            <td>HTTP 端点不可达，且缓存已超过 <code>max_stale_seconds</code></td>
+            <td>修复端点连通性；增大 <code>max_stale_seconds</code></td>
+          </tr>
+          <tr>
+            <td>启动时报 Duplicate api_key 错误</td>
+            <td>同一密钥分配给多个租户</td>
+            <td>确保每把密钥在所有租户间唯一</td>
+          </tr>
+        </tbody>
+      </table>
+
+    </main>
+  </div>
+</body>
+</html>

@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>隔离会话 · OpenSandbox 指南（中文）</title>
+  <meta name="description" content="在沙箱内通过 bubblewrap 隔离的按次执行 bash 会话，用于快速、受控的代码运行。" />
+  <link rel="stylesheet" href="guides-zh.css" />
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <a class="brand" href="index.html">OpenSandbox</a>
+      <div class="brand-sub">功能指南 · 中文版</div>
+      <h2>目录</h2>
+      <nav>
+      <a href="index.html">总览</a>
+      <a href="credential-vault.html">凭证保管库</a>
+      <a href="secure-access.html">安全访问</a>
+      <a href="secure-container.html">安全容器运行时</a>
+      <a href="multi-tenancy.html">多租户</a>
+      <a href="isolation-sessions.html" class="active">隔离会话</a>
+      <a href="pause-resume.html">暂停与恢复</a>
+      <a href="qemu-vmstate-snapshots.html">QEMU VMState 快照</a>
+      <a href="egress-sse-truncation.html">Egress SSE 截断</a>
+      <a href="lifecycle-hooks.html">生命周期钩子</a>
+      <a href="windows-sandbox.html">Windows 沙箱</a>
+      <a href="client-pool.html">客户端 Pool</a>
+      <a href="component-telemetry.html">组件遥测</a>
+      </nav>
+      <p class="note" style="margin-top:1.5rem">由英文 docs/guides/*.md 翻译的静态 HTML，便于本地阅读。</p>
+    </aside>
+    <main class="content">
+      <header class="page-head">
+        <h1>隔离会话</h1>
+        <p class="desc">在沙箱内通过 bubblewrap 隔离的按次执行 bash 会话，用于快速、受控的代码运行。</p>
+      </header>
+
+      <nav class="toc">
+        <strong>目录</strong>
+        <ol>
+          <li><a href="#requirements">要求</a></li>
+          <li><a href="#overview">概述</a></li>
+          <li><a href="#how-it-works">工作原理</a></li>
+          <li><a href="#quick-start">快速开始</a></li>
+          <li><a href="#session-lifecycle">会话生命周期</a></li>
+          <li><a href="#workspace-modes">工作区模式</a></li>
+          <li><a href="#bind-mounts-and-allowlist">绑定挂载与白名单</a></li>
+          <li><a href="#profiles-and-defaults">配置档与默认值</a></li>
+          <li><a href="#environment-uid-and-networking">环境变量、UID 与网络</a></li>
+          <li><a href="#filesystem-proxy">文件系统代理</a></li>
+          <li><a href="#capabilities-and-probing">能力探测</a></li>
+          <li><a href="#server-configuration">服务端配置</a></li>
+          <li><a href="#limitations">限制</a></li>
+          <li><a href="#see-also">另见</a></li>
+        </ol>
+      </nav>
+
+      <hr />
+
+      <h2 id="requirements">要求</h2>
+      <p>本指南所涉功能需要的组件版本：</p>
+      <ul>
+        <li><code>execd</code> &gt;= 1.0.20 提供基础隔离会话支持；<strong>&gt;= 1.0.21 推荐</strong>，以获得 <code>binds</code>、<code>List sessions</code>、<code>uid_mode: "userns"</code>，以及默认可写白名单（<code>/workspace</code>、<code>/mnt</code>、<code>/media</code>、<code>/data</code>）</li>
+        <li><code>opensandbox-server</code> &gt;= 0.2.1 — 当 execd 镜像声明 <code>bootstrap.execd.isolation</code> 时，服务端会注入 <code>CAP_SYS_ADMIN</code>、<code>apparmor=unconfined</code>，以及 <code>bwrap</code> 所需的 tmpfs 挂载</li>
+        <li>Python SDK &gt;= 0.1.14（<code>isolation.run_once</code> / <code>isolation.session</code> 上下文管理器）；仅生成 isolation 客户端时 &gt;= 0.1.13 即可</li>
+        <li>JavaScript / TypeScript SDK &gt;= 0.1.10（<code>isolation.runOnce</code> / <code>isolation.withSession</code>）</li>
+        <li>Kotlin / Java SDK &gt;= 1.0.16（<code>isolation.runOnce()</code> / <code>isolation.withSession { ... }</code>）；仅生成 isolation 客户端时 &gt;= 1.0.15 即可</li>
+        <li>C# SDK &gt;= 0.1.4（<code>RunOnceAsync</code> / <code>WithSessionAsync</code>）</li>
+        <li>Go SDK &gt;= 1.0.4（<code>IsolationRunOnce</code> / <code>IsolationWithSession</code>）</li>
+      </ul>
+      <p><a href="#capabilities-and-probing"><code>/capabilities</code></a> 上的 <code>setpriv_available</code> / <code>userns_available</code> 字段是在 execd v1.0.21 之后加入的；撰文时仅 <code>main</code> 分支上的 execd 构建包含它们。较旧的 execd 会省略这两个字段（客户端必须容忍其缺失）。</p>
+      <p>主机要求（<code>bwrap</code> 二进制、<code>CAP_SYS_ADMIN</code>、<code>overlayfs</code> 等）见 <a href="#server-configuration">服务端配置 → 主机要求</a>。</p>
+      <p>已发布的 execd 镜像包含会话启动时使用的 fail-closed 原生 workload gate。若从 Linux 源码构建，<code>make build</code> 需要 C 编译器与静态 libc，并产出 <code>bin/opensandbox-session-gate</code>；启动 execd 前请先运行 <code>make build-session-gate</code>，再执行 <code>sudo make install-session-gate</code>，将辅助程序安装到 <code>/opt/opensandbox/opensandbox-session-gate</code>。请保持该路径及其父目录由 root 拥有，且不可被 group 或 world 写入。</p>
+
+      <hr />
+
+      <h2 id="overview">概述</h2>
+      <table>
+        <thead>
+          <tr><th>概念</th><th>边界</th><th>启动开销</th><th>典型用途</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>隔离会话</strong></td>
+            <td>单个沙箱内的 bubblewrap 命名空间</td>
+            <td>创建约 100 ms；在已有会话中后续 <code>run</code> 开销接近零</td>
+            <td>大量短生命周期、相互隔离的任务复用同一长生命周期会话</td>
+          </tr>
+          <tr>
+            <td>Bash 会话（<code>/session</code>）</td>
+            <td>bash 进程，无额外命名空间</td>
+            <td>毫秒级</td>
+            <td>交互式 REPL 风格的命令序列</td>
+          </tr>
+          <tr>
+            <td>沙箱</td>
+            <td>容器或 Pod</td>
+            <td>数百毫秒到数秒</td>
+            <td>租户、工作区或用户边界</td>
+          </tr>
+          <tr>
+            <td>安全运行时（gVisor / Kata）</td>
+            <td>每个沙箱的用户态内核或虚拟机</td>
+            <td>10–500 ms</td>
+            <td>硬件级防护，抵御容器逃逸</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="callout info">
+        <span class="label">会话创建 vs. 每次 run 的开销</span>
+        <p>创建会话大约需要 100 ms，因为 execd 在启动 <code>bwrap</code> 后会短暂等待，以检测立即退出的子进程。会话一旦存在，每次 <code>POST /run</code> 都会复用同一个 bash 进程，因此单次 run 的开销可忽略不计。设计负载时应把创建成本摊销到同一会话中的多次 <code>run</code> 调用上。</p>
+      </div>
+
+      <p>适合场景：<strong>RL rollouts</strong>、<strong>批量代码评分</strong>、<strong>多工具 agent 运行</strong> — 每个 worker 一个沙箱，内部再跑大量隔离任务。</p>
+      <p>不适合：跨语言 kernel（请用 <code>/code</code>）、交互式 REPL（请用 <code>/session</code>），或需要硬信任边界抵御内核漏洞利用（请用 gVisor / Kata；参见 <a href="secure-container.html">安全容器运行时</a>）。</p>
+
+      <hr />
+
+      <h2 id="how-it-works">工作原理</h2>
+      <p><code>execd</code> 为每个会话 fork 一个 <code>bwrap</code> 子进程；<code>bwrap</code> 设置 Linux 命名空间，然后在其中 <code>exec</code> 一个长生命周期的 <code>bash</code>。</p>
+      <p><img alt="隔离会话运行时布局" src="../../public/images/isolation-sessions-layout.svg" /></p>
+      <p>图中未展示的两点：</p>
+      <ul>
+        <li><code>bash</code> 是长生命周期的，因此一次 <code>run</code> 中的 <code>export X=1</code> 对<strong>同一会话</strong>中的下一次 <code>run</code> 可见（绝不会对另一会话可见）。</li>
+        <li>FS 代理从命名空间<strong>外部</strong>读写合并后的工作区视图，因此即使 <code>bash</code> 正忙，上传与下载仍可工作。</li>
+      </ul>
+
+      <h3 id="run-request-flow"><code>run</code> 请求流程</h3>
+      <p><img alt="隔离会话 run 流程" src="../../public/images/isolation-sessions-run-flow.svg" /></p>
+      <p>非成功路径：</p>
+      <table>
+        <thead>
+          <tr><th>事件</th><th>发生什么</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Run 的 <code>timeout_seconds</code> 到期</td>
+            <td>execd 取消该 run 上下文，向 bwrap 进程组发送 <code>SIGINT</code>，并发出 <code>IsolatedError</code> SSE 事件；会话本身保持存活。</td>
+          </tr>
+          <tr>
+            <td><code>bwrap</code> 进程已退出</td>
+            <td>下一次 <code>run</code> 返回带有 <code>session process has exited</code> 的 <code>IsolatedError</code> SSE 事件；只有 <code>ErrContextNotFound</code>（会话 ID 未知）会变成 HTTP 级错误。需 <code>DELETE</code> 后重建。</td>
+          </tr>
+          <tr>
+            <td>空闲超时到达</td>
+            <td>GC 执行与 <code>DELETE</code> 相同的拆除逻辑。</td>
+          </tr>
+          <tr>
+            <td>客户端在 SSE 中途断开</td>
+            <td>Gin 请求上下文被取消，execd 向正在运行的命令发送 <code>SIGINT</code>；该 run <strong>不会</strong>在后台继续执行。</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <hr />
+
+      <h2 id="quick-start">快速开始</h2>
+
+      <h3 id="curl">curl</h3>
+      <pre><code class="language-bash"># Probe.
+curl -s http://localhost:44772/v1/isolated/capabilities
+
+# Create.
+SESSION=$(curl -s -X POST http://localhost:44772/v1/isolated/session \
+  -H "Content-Type: application/json" \
+  -d '{
+    "profile": "strict",
+    "workspace": {"path": "/workspace", "mode": "overlay"},
+    "idle_timeout_seconds": 300
+  }' | jq -r .session_id)
+
+# Run (SSE: stdout / error / complete).
+curl -N -X POST "http://localhost:44772/v1/isolated/session/$SESSION/run" \
+  -H "Content-Type: application/json" \
+  -d '{"code": "export X=1; echo $X", "timeout_seconds": 30}'
+
+# Second run reuses shell state.
+curl -N -X POST "http://localhost:44772/v1/isolated/session/$SESSION/run" \
+  -H "Content-Type: application/json" \
+  -d '{"code": "echo $X"}'  # prints 1
+
+# Delete.
+curl -X DELETE "http://localhost:44772/v1/isolated/session/$SESSION"</code></pre>
+
+      <h3 id="python-sdk">Python SDK</h3>
+      <pre><code class="language-python">from opensandbox import Sandbox
+from opensandbox.models.isolated import (
+    CreateIsolatedSessionRequest, IsolatedWorkspaceSpec, IsolatedRunOpts,
+)
+
+# Sandbox.create is an async classmethod, so await it before entering
+# the async context manager.
+async with (await Sandbox.create("python:3.11")) as sandbox:
+    # One-shot.
+    await sandbox.isolation.run_once(
+        "python -c 'print(42)'", workspace="/workspace", profile="strict",
+    )
+
+    # Persistent session.
+    async with sandbox.isolation.session(
+        CreateIsolatedSessionRequest(
+            workspace=IsolatedWorkspaceSpec(path="/workspace", mode="overlay"),
+            profile="strict",
+            idle_timeout_seconds=300,
+        )
+    ) as session:
+        await session.run("export STAGE=train")
+        await session.run("python train.py", opts=IsolatedRunOpts(timeout_seconds=600))
+        await session.files.write_file("/workspace/data.csv", data_bytes)
+
+    # Reattach after a client restart.
+    handle = await sandbox.isolation.attach(known_session_id)</code></pre>
+
+      <h3 id="javascript-typescript-sdk">JavaScript / TypeScript SDK</h3>
+      <pre><code class="language-ts">await sandbox.isolation.runOnce("node -e 'console.log(1)'", "/workspace", {
+  profile: "strict",
+});
+
+await sandbox.isolation.withSession(
+  { profile: "strict", workspace: { path: "/workspace", mode: "overlay" } },
+  async (session) =&gt; { await session.run("npm test"); },
+);</code></pre>
+
+      <h3 id="kotlin-sdk">Kotlin SDK</h3>
+      <pre><code class="language-kotlin">sandbox.isolation().runOnce(code = "python -c 'print(1)'", workspace = "/workspace")
+
+sandbox.isolation().withSession(request) { session -&gt;
+    session.run("ls /workspace")
+}</code></pre>
+
+      <hr />
+
+      <h2 id="session-lifecycle">会话生命周期</h2>
+      <p>位于 execd 的 <code>/v1/isolated/</code> 下。当 execd 配置了访问令牌时，请使用 <code>X-EXECD-ACCESS-TOKEN</code>。</p>
+      <table>
+        <thead>
+          <tr><th>方法</th><th>路径</th><th>用途</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>POST</code></td><td><code>/session</code></td><td>创建；返回 <code>{session_id, created_at}</code>。</td></tr>
+          <tr><td><code>GET</code></td><td><code>/sessions</code></td><td>列出活动会话。</td></tr>
+          <tr><td><code>GET</code></td><td><code>/session/{id}</code></td><td>完整状态；回显创建参数，便于无状态客户端重建句柄。</td></tr>
+          <tr><td><code>POST</code></td><td><code>/session/{id}/run</code></td><td>前台（默认）：SSE 流 <code>stdout</code> / <code>error</code> / <code>complete</code>。后台（<code>"background": true</code>）：返回 <code>202</code> 与 run 句柄。同一会话上的 run 会串行化。</td></tr>
+          <tr><td><code>GET</code></td><td><code>/session/{id}/runs/{runId}</code></td><td>后台 run 状态：<code>running</code>、<code>exit_code</code>、<code>error</code>、时间戳。</td></tr>
+          <tr><td><code>GET</code></td><td><code>/session/{id}/runs/{runId}/logs</code></td><td>后台 run 的合并输出（纯文本），支持字节游标分页。</td></tr>
+          <tr><td><code>DELETE</code></td><td><code>/session/{id}</code></td><td>销毁。</td></tr>
+          <tr><td><code>GET</code></td><td><code>/capabilities</code></td><td>能力探测。</td></tr>
+        </tbody>
+      </table>
+      <p><code>idle_timeout_seconds &gt; 0</code> 会自动销毁空闲会话；设为 <code>0</code> 可禁用空闲 GC，并始终显式 <code>DELETE</code>。</p>
+
+      <hr />
+
+      <h2 id="background-runs">后台运行</h2>
+      <p>后台 run 在会话内以分离方式启动代码并立即返回；run 的合并 stdout/stderr 与退出码由 execd 捕获，客户端可在会话继续执行其他工作的同时轮询它们。</p>
+      <pre><code class="language-bash"># Start detached; 202 returns {"session_id", "run_id", "started_at"}.
+RUN=$(curl -s -X POST "http://localhost:44772/v1/isolated/session/$SESSION/run" \
+  -H "Content-Type: application/json" \
+  -d '{"code": "sleep 5 &amp;&amp; echo done", "background": true}' | jq -r .run_id)
+
+# Poll status until running=false.
+curl -s "http://localhost:44772/v1/isolated/session/$SESSION/runs/$RUN"
+
+# Read output (plain text). The response header EXECD-ISOLATED-TAIL-CURSOR
+# carries the next byte offset for incremental reads.
+curl -s "http://localhost:44772/v1/isolated/session/$SESSION/runs/$RUN/logs"
+curl -s "http://localhost:44772/v1/isolated/session/$SESSION/runs/$RUN/logs?cursor=123"</code></pre>
+      <p>Python SDK：</p>
+      <pre><code class="language-python">session = await sandbox.isolation.create(CreateIsolatedSessionRequest(
+    workspace=IsolatedWorkspaceSpec(path="/workspace", mode="rw"),
+))
+
+run = await session.run_background("sleep 5 &amp;&amp; echo done")
+while (status := await session.run_status(run.run_id)).running:
+    await asyncio.sleep(0.2)
+print(status.exit_code)
+logs = await session.run_logs(run.run_id)   # .text + .cursor for pagination</code></pre>
+      <p>后台 run 语义：</p>
+      <ul>
+        <li><code>timeout_seconds</code> 仅适用于前台；后台 run 不受时间限制。</li>
+        <li>后台 run 处于活动状态时，空闲 GC 会暂停；结束后恢复正常空闲窗口。删除会话会终止该 run。</li>
+        <li>后台 run 需要可写的日志位置，因此只读（<code>ro</code>）工作区的会话会以 <code>400</code> 拒绝；<code>rw</code> 与 <code>overlay</code> 工作区受支持。</li>
+        <li>Run 与会话共享同一进程组，因此会话级信号（例如前台 run 超时或取消时发送的 <code>SIGINT</code>）也会送达它们。</li>
+        <li>每次 <code>logs</code> 请求最多返回 16 MiB；对大输出请用返回的游标分页。每个 run 的日志保留上限为 16 MiB — 超出部分在 run 完成时丢弃，因此若需要超过第一页的内容，请在 run 活跃时增量拉取。</li>
+        <li>若会话在 run 进行中死亡，会报告 <code>running: false</code> 且 <code>error: "session terminated"</code>；会话被删除或垃圾回收时，run 记录及其日志会被移除。</li>
+      </ul>
+
+      <hr />
+
+      <h2 id="workspace-modes">工作区模式</h2>
+      <table>
+        <thead>
+          <tr><th>模式</th><th>语义</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>rw</code></td><td>读写绑定挂载；写入会持久化到主机。</td></tr>
+          <tr><td><code>overlay</code>（默认）</td><td>通过 overlayfs 写时复制；写入进入每会话的 upper 目录，并在 <code>DELETE</code> 时消失。</td></tr>
+          <tr><td><code>ro</code></td><td>只读绑定挂载；写入会以 <code>EROFS</code> 失败。</td></tr>
+        </tbody>
+      </table>
+      <p>Overlay 的 upper 目录位于 <code>upper_root</code> 下（默认 <code>/var/lib/execd/isolation</code>）。</p>
+      <p>由于隔离会话状态仅存在于 execd 内存中，execd 退出时留在 <code>upper_root</code> 下的每个 upper 目录都会成为孤儿。启动时 execd 会回收 <code>upper_root</code> 下残留的会话目录 — 会话状态从不会跨重启存活，因此不会丢失合法数据。只会删除具有 execd 会话布局（<code>&lt;id&gt;/upper</code>）的目录；若 <code>upper_root</code> 指向与其它数据共享的目录，无关子项绝不会被触碰（<code>upper_root</code> 仍应是专用目录）。尚无法删除的残留 — 例如仍被上一生命周期挂载引用的 upper — 会计入 <code>upper_max_bytes</code>，并由空闲收集器重试。在池化 / 预置沙箱中，这也能防止一名占用者的会话数据泄漏给下一名。</p>
+      <pre><code class="language-json">{ "workspace": { "path": "/workspace", "mode": "overlay" } }</code></pre>
+
+      <hr />
+
+      <h2 id="bind-mounts-and-allowlist">绑定挂载与白名单</h2>
+      <ul>
+        <li><strong><code>extra_writable</code></strong> — 以相同路径读写绑定挂载的路径（<code>source == destination</code>）。</li>
+        <li><strong><code>binds</code></strong> — 显式 <code>source</code> → <code>dest</code> 映射，可选 <code>readonly</code>。<code>source</code> 必须已存在；<code>dest</code> 必须已在命名空间内存在（请将其烘焙进沙箱镜像）。</li>
+      </ul>
+      <pre><code class="language-json">{
+  "workspace": { "path": "/workspace", "mode": "rw" },
+  "extra_writable": ["/data/scratch"],
+  "binds": [
+    { "source": "/data/in",  "dest": "/mnt/in",  "readonly": true },
+    { "source": "/data/out", "dest": "/mnt/out" }
+  ]
+}</code></pre>
+      <p>每个 <code>source</code> 在符号链接解析<strong>之后</strong>对照运维配置的 <code>allowed_writable</code> 白名单检查，因此符号链接无法逃逸白名单。默认白名单：<code>/workspace</code>、<code>/mnt</code>、<code>/media</code>、<code>/data</code>（允许子路径）。空白名单会拒绝所有额外绑定。</p>
+
+      <hr />
+
+      <h2 id="profiles-and-defaults">配置档与默认值</h2>
+      <p><code>profile</code> 字段当前仅控制命名空间内如何暴露 <code>/tmp</code>：</p>
+      <table>
+        <thead>
+          <tr><th>配置档</th><th><code>/tmp</code></th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>strict</code>（默认）</td><td>私有 tmpfs（<code>--tmpfs /tmp</code>）</td></tr>
+          <tr><td><code>balanced</code></td><td>与沙箱共享（<code>--bind /tmp /tmp</code>）</td></tr>
+        </tbody>
+      </table>
+      <p><code>workspace.mode</code> 与 <code>env_passthrough</code> <strong>独立于</strong>配置档：省略时，无论选择哪个配置档，execd 都会将 <code>workspace.mode</code> 规范化为 <code>overlay</code>，将 <code>env_passthrough.mode</code> 规范化为 <code>deny</code>。若需要持久的工作区写入（<code>"rw"</code>）或主机环境透传（<code>"allow"</code>），请显式设置这些字段。</p>
+
+      <hr />
+
+      <h2 id="environment-uid-and-networking">环境变量、UID 与网络</h2>
+      <ul>
+        <li><strong><code>env_passthrough</code></strong> — <code>mode: "allow"</code> + <code>keys</code> 白名单主机环境变量；默认 <code>deny</code>。每次 run 的覆盖放在 <code>IsolatedRunRequest.envs</code>。</li>
+        <li><strong><code>uid</code> / <code>gid</code></strong> 配合 <strong><code>uid_mode: "setpriv"</code></strong>（默认，真实 setuid/setgid 降权）或 <strong><code>"userns"</code></strong>（用户命名空间重映射）。请求某种模式前，请先通过 <a href="#capabilities-and-probing"><code>/capabilities</code></a> 检查 <code>setpriv_available</code> / <code>userns_available</code>。</li>
+        <li><strong><code>share_net: true</code></strong> 共享沙箱的网络命名空间。沙箱级 egress 与凭证保管库策略仍然生效。</li>
+        <li><strong><code>share_net: false</code></strong> 创建私有网络命名空间。在释放 workload 启动门控之前，execd 会打开已认证的 NetNS，用 <code>NS_GET_USERNS</code> 取得其真实拥有的 UserNS，并将二者绑定固定到 <code>/run/execd/namespaces/&lt;opaque-id&gt;/</code> 下。任何校验或固定失败都会中止会话创建。execd 会在启动失败、进程退出、显式删除、空闲回收以及 runner 关闭时尝试清理固定；可重试的失败会保留会话所有权，并在 execd 存活期间重试。这适用于两种 UID 模式；加固的网络后端将要求 <code>uid_mode: "userns"</code>。</li>
+      </ul>
+      <p>本阶段遗留默认行为不变：省略 <code>share_net</code> 仍会共享沙箱网络命名空间。仅命名空间固定本身并不会启用会话的 egress 或 ingress。</p>
+      <p>私有会话无法在 execd 重启后恢复。启用它们的部署必须将 execd 视为沙箱关键组件，并在 execd 退出时重建整个沙箱/容器；不得在仍存活的挂载命名空间内启动替换的 execd。销毁沙箱/容器会拆除该挂载命名空间并释放所有固定。execd 有意在启动时不扫描并接管不透明的命名空间固定目录，因为它们没有持久的沙箱世代信息，这样做可能卸载另一存活进程的资源。</p>
+
+      <hr />
+
+      <h2 id="filesystem-proxy">文件系统代理</h2>
+      <p>从命名空间外部读写会话的<strong>合并</strong>工作区视图 — 这是 SDK 在不启动 shell 的情况下进行 <code>upload</code>、<code>download</code> 与 <code>list</code> 的方式。所有路径均按会话位于 <code>/v1/isolated/session/{id}/</code> 下：</p>
+      <table>
+        <thead>
+          <tr><th>方法</th><th>路径</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>GET</code></td><td><code>files/info?path=...</code></td></tr>
+          <tr><td><code>GET</code></td><td><code>files/download?path=...</code>（支持 <code>Range</code> 与 <code>offset</code>/<code>limit</code>）</td></tr>
+          <tr><td><code>POST</code></td><td><code>files/upload</code>（multipart：<code>metadata</code> + <code>file</code>）</td></tr>
+          <tr><td><code>DELETE</code></td><td><code>files?path=...</code></td></tr>
+          <tr><td><code>POST</code></td><td><code>files/mv</code></td></tr>
+          <tr><td><code>POST</code></td><td><code>files/permissions</code></td></tr>
+          <tr><td><code>POST</code></td><td><code>files/replace?verbose=true</code></td></tr>
+          <tr><td><code>GET</code></td><td><code>files/search?path=...&amp;pattern=...</code></td></tr>
+          <tr><td><code>GET</code></td><td><code>directories/list?path=...&amp;depth=N</code></td></tr>
+          <tr><td><code>POST</code></td><td><code>directories</code></td></tr>
+          <tr><td><code>DELETE</code></td><td><code>directories?path=...</code></td></tr>
+        </tbody>
+      </table>
+      <p>在 <code>ro</code> 工作区上的写入会失败；在 <code>overlay</code> 上的写入进入 upper 目录，并在 <code>DELETE</code> 时消失。</p>
+
+      <hr />
+
+      <h2 id="capabilities-and-probing">能力探测</h2>
+      <pre><code class="language-bash">curl -s http://localhost:44772/v1/isolated/capabilities</code></pre>
+      <pre><code class="language-json">{
+  "available": true,
+  "isolator": "bwrap",
+  "version": "0.9.0",
+  "setpriv_available": true,
+  "userns_available": false,
+  "commit_supported": false,
+  "diff_supported": false
+}</code></pre>
+      <ul>
+        <li><code>available: false</code> — 可信原生 workload gate 缺失或不可信、缺少 bubblewrap，或主机无法创建所需命名空间（缺少 <code>CAP_SYS_ADMIN</code>、受限的 user-ns sysctl 等）。</li>
+        <li><code>setpriv_available</code> / <code>userns_available</code> — 是否可创建 <code>uid_mode: "setpriv"</code> 或 <code>"userns"</code> 的会话。<code>setpriv_available</code> 仅反映 execd 的<strong>默认</strong> UID/GID；请求不同 UID/GID 的会话在身份切换不可用时仍可能返回 <code>503 NOT_SUPPORTED</code>。</li>
+        <li><code>commit_supported</code> / <code>diff_supported</code> — 第二阶段占位，目前返回 <code>503</code>。</li>
+      </ul>
+
+      <hr />
+
+      <h2 id="server-configuration">服务端配置</h2>
+      <p>将 execd 指向可选的 TOML 文件：</p>
+      <table>
+        <thead>
+          <tr><th>Flag</th><th>环境变量</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>--isolation-config</code></td><td><code>EXECD_ISOLATION_CONFIG</code></td></tr>
+        </tbody>
+      </table>
+      <pre><code class="language-toml"># Parent directory for per-session overlay upper dirs.
+upper_root = "/var/lib/execd/isolation"
+
+# Allocation-time threshold for total overlay upper-directory size (bytes).
+# Existing sessions can write beyond this value.
+# Default: 8 GiB. Set to 0 to disable the allocation check.
+upper_max_bytes = 8589934592  # 8 GiB
+
+# Sources allowed for extra_writable / binds (symlink-resolved).
+# Default: ["/workspace", "/mnt", "/media", "/data"]. Empty = reject all.
+allowed_writable = ["/workspace", "/mnt", "/media", "/data"]</code></pre>
+      <p>示例：<code>components/execd/configs/isolation.example.toml</code>。</p>
+      <p><code>upper_max_bytes</code> 在创建 <code>overlay</code> 工作区（默认模式）时检查。若成功的用量扫描报告总量达到或超过配置的正数限制，新会话会被拒绝。该设置不会限制已有会话的写入，也不适用于 <code>rw</code> 或 <code>ro</code> 工作区。</p>
+      <p>删除 overlay 会话并在其清理成功、总用量降到阈值以下后，可恢复准入。删除会丢弃该会话的私有 upper 数据，因此删除前请保留所需数据。</p>
+      <p><strong>主机要求：</strong> execd 镜像中的 <code>bwrap</code> 与可信原生 workload gate；<code>CAP_SYS_ADMIN</code>（以及用于 <code>uid_mode: "userns"</code> 的 <code>kernel.unprivileged_userns_clone=1</code>）；内核中的 <code>overlayfs</code>（用于 <code>overlay</code> 工作区）。已发布镜像会自动安装 gate。Linux 源码构建必须在启动 execd 前，从 <code>components/execd</code> 运行 <code>make build-session-gate</code>，再执行 <code>sudo make install-session-gate</code>。</p>
+      <p>注意：当原生 workload gate 无法作为可信可执行文件打开，或 bwrap 本身无法启动（缺少二进制或缺少命名空间能力）时，<code>/capabilities</code> 会报告 <code>available: false</code>。缺少 <code>overlayfs</code> <strong>不会</strong>翻转 <code>available</code> — overlay 探测仅影响第二阶段的 <code>commit</code>/<code>diff</code> 支持，而此类主机上默认 overlay 模式的会话创建仍可能在运行时失败。若依赖 <code>workspace.mode: "overlay"</code>，请直接在主机上验证 <code>overlayfs</code> 支持。</p>
+
+      <hr />
+
+      <h2 id="limitations">限制</h2>
+      <ul>
+        <li><strong><code>diff</code> / <code>commit</code> 是第二阶段占位</strong>，目前返回 <code>503</code>。</li>
+        <li><strong>无硬件级保证。</strong>仅有命名空间 + seccomp；若需抵御内核漏洞利用，请搭配安全运行时。</li>
+        <li><strong>仅 Linux。</strong>非 Linux 构建返回 <code>available: false</code>。</li>
+        <li><strong>每会话串行 run</strong> — 需要并行时请创建多个会话。</li>
+        <li><strong>绑定目标必须预先存在</strong>于沙箱镜像中。</li>
+      </ul>
+
+      <hr />
+
+      <h2 id="see-also">另见</h2>
+      <ul>
+        <li><a href="../../architecture/data-plane/execd">execd</a></li>
+        <li><a href="secure-container.html">安全容器运行时</a></li>
+        <li><a href="../../api/">execd OpenAPI 规范</a></li>
+      </ul>
+
+      <div class="footer-nav">
+        <a href="multi-tenancy.html">← 多租户</a>
+        <a href="pause-resume.html">暂停与恢复 →</a>
+      </div>
+
+    </main>
+  </div>
+</body>
+</html>

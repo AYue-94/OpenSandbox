@@ -1,0 +1,577 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>QEMU VMState 快照 · OpenSandbox 指南（中文）</title>
+  <meta name="description" content="为 runc 沙箱内运行的 QEMU 配置并操作进程级暂停与恢复。" />
+  <link rel="stylesheet" href="guides-zh.css" />
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <a class="brand" href="index.html">OpenSandbox</a>
+      <div class="brand-sub">功能指南 · 中文版</div>
+      <h2>目录</h2>
+      <nav>
+      <a href="index.html">总览</a>
+      <a href="credential-vault.html">凭证保管库</a>
+      <a href="secure-access.html">安全访问</a>
+      <a href="secure-container.html">安全容器运行时</a>
+      <a href="multi-tenancy.html">多租户</a>
+      <a href="isolation-sessions.html">隔离会话</a>
+      <a href="pause-resume.html">暂停与恢复</a>
+      <a href="qemu-vmstate-snapshots.html" class="active">QEMU VMState 快照</a>
+      <a href="egress-sse-truncation.html">Egress SSE 截断</a>
+      <a href="lifecycle-hooks.html">生命周期钩子</a>
+      <a href="windows-sandbox.html">Windows 沙箱</a>
+      <a href="client-pool.html">客户端 Pool</a>
+      <a href="component-telemetry.html">组件遥测</a>
+      </nav>
+      <p class="note" style="margin-top:1.5rem">由英文 docs/guides/*.md 翻译的静态 HTML，便于本地阅读。</p>
+    </aside>
+    <main class="content">
+      <header class="page-head">
+        <h1>QEMU VMState 快照</h1>
+        <p class="desc">为 runc 沙箱内运行的 QEMU 配置并操作进程级暂停与恢复。</p>
+      </header>
+      <nav class="toc">
+        <strong>本页目录</strong>
+        <ol>
+          <li><a href="#state-model">状态与制品模型</a></li>
+          <li><a href="#prepare-image">准备 QEMU 工作负载镜像</a></li>
+          <li><a href="#pause-resume">暂停与恢复流程</a></li>
+          <li><a href="#helm">使用 Helm 做生产部署</a></li>
+          <li><a href="#validation">验证</a></li>
+          <li><a href="#troubleshooting">故障排查</a></li>
+        </ol>
+      </nav>
+
+      <p>本指南说明如何准备、部署并验证支持进程级暂停与恢复的 QEMU-in-runc 工作负载。该工作负载在普通 runc 容器内运行 QEMU，并不使用虚拟化的 Kubernetes <code>RuntimeClass</code>。</p>
+
+      <p>此模式仍为实验性。它会恢复 QEMU Guest 内存、vCPU 以及可迁移设备状态。外层 runc 容器中的其他进程会从 <code>BatchSandbox</code> Pod 模板重新启动。</p>
+
+      <p>初始的 <code>qemu-v1</code> 实现支持同一 <code>BatchSandbox</code> 的暂停与恢复。公开的快照克隆 API 尚不能恢复 QEMU VMState，因为其快照记录不会持久化完整的 Pod 模板与 QEMU 启动计划。独立的公开快照操作在发布制品后会恢复其源 VM。</p>
+
+      <h2 id="state-model">状态与制品模型</h2>
+
+      <table>
+        <thead>
+          <tr><th>状态</th><th>存储</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>外层容器 rootfs</td><td>既有的 rootfs 快照镜像</td></tr>
+          <tr><td>可写 Guest qcow2 overlay</td><td>Rootfs 快照镜像；overlay 不得位于 Kubernetes volume mount 之下</td></tr>
+          <tr><td>Guest RAM、vCPU 与模拟设备状态</td><td>包含 zstd 压缩 QEMU migration stream 的 VMState 镜像</td></tr>
+          <tr><td>不可变 Guest 基础镜像</td><td>原始镜像层，或可独立获取的只读卷</td></tr>
+          <tr><td>PVC、hostPath、云盘、网络对端状态</td><td>OpenSandbox 不会复制</td></tr>
+        </tbody>
+      </table>
+
+      <p>两类镜像都会被推送到已配置的镜像 Registry，并以 manifest digest 记录在同一份 <code>SandboxSnapshot.status</code> 中。恢复从不依赖可变 tag。</p>
+
+      <h2 id="prepare-image">准备 QEMU 工作负载镜像</h2>
+
+      <p>QEMU 支持是工作负载镜像与 OpenSandbox 之间的约定。镜像必须：</p>
+      <ol>
+        <li>使用 QMP Unix socket 启动 QEMU；</li>
+        <li>根据生效的 QEMU 设置生成 OpenSandbox launch manifest；</li>
+        <li>将 v1 捕获的每个可写 Guest overlay 保留在容器 rootfs 中；</li>
+        <li>识别 OpenSandbox 恢复环境，并为 QEMU 添加 <code>-incoming</code>；</li>
+        <li>仅在 QMP socket 与 Guest 服务可用后才变为 Ready。</li>
+      </ol>
+
+      <h3>声明 Pod 模板约定</h3>
+
+      <p>在创建 QEMU 容器的 Pod 模板上设置以下 annotations。对于独立沙箱，使用 <code>BatchSandbox.spec.template.metadata</code>。对于池化沙箱，使用 <code>Pool.spec.template.metadata</code>，以便分配出的 Pod 携带该约定。</p>
+
+<pre><code>annotations:
+  sandbox.opensandbox.io/checkpoint-provider: qemu
+  sandbox.opensandbox.io/qemu-container: qemu
+  sandbox.opensandbox.io/qemu-qmp-socket: /run/qemu/qmp.sock
+  sandbox.opensandbox.io/qemu-launch-manifest: /run/qemu/launch.json
+  # Optional: constrain restore to compatible nodes.
+  sandbox.opensandbox.io/qemu-required-node-class: shenlong-v1</code></pre>
+
+      <table>
+        <thead>
+          <tr><th>Annotation</th><th>是否必需</th><th>用途</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>checkpoint-provider</code></td><td>是</td><td>选择 <code>qemu</code> provider。OpenSandbox 不会扫描进程名。</td></tr>
+          <tr><td><code>qemu-container</code></td><td>是</td><td>命名拥有 QEMU、QMP 与 launch manifest 的 Pod 容器。</td></tr>
+          <tr><td><code>qemu-qmp-socket</code></td><td>是</td><td>该容器内 QMP Unix socket 的干净绝对路径。</td></tr>
+          <tr><td><code>qemu-launch-manifest</code></td><td>是</td><td>该容器内 OpenSandbox launch manifest 的干净绝对路径。</td></tr>
+          <tr><td><code>qemu-required-node-class</code></td><td>否</td><td>将恢复限制到带有匹配 OpenSandbox QEMU node-class 标签的节点。</td></tr>
+        </tbody>
+      </table>
+
+      <p>这些路径是容器内路径。它们不需要挂载进 controller Pod。snapshot worker 通过节点上的容器运行时到达目标容器。</p>
+
+      <h3>生成 OpenSandbox launch manifest</h3>
+
+      <p>Launch manifest 由 OpenSandbox 定义。它不是原生 QEMU 文件，QEMU 也不会自动创建它。工作负载镜像维护者必须在 Pod 变为 Ready 之前生成该文件。</p>
+
+      <p>在容器 entrypoint 中，用与构建 QEMU 命令相同的生效值生成该文件。当 CPU、内存、磁盘或设备可能通过环境变量或 Pod 模板变化时，不要把静态文件烘焙进 Docker 镜像。</p>
+
+      <p>Launch manifest 示例：</p>
+
+<pre><code>{
+  "formatVersion": "qemu-v1",
+  "architecture": "amd64",
+  "qemuVersion": "6.2.0",
+  "machineType": "pc-q35-6.2",
+  "cpuModel": "host",
+  "vcpus": 2,
+  "memoryBytes": 536870912,
+  "qemuConfigDigest": "sha256:...",
+  "disks": [
+    {
+      "id": "osdisk",
+      "overlayPath": "/vm/state.qcow2",
+      "capture": "rootfs"
+    }
+  ]
+}</code></pre>
+
+      <table>
+        <thead>
+          <tr><th>字段</th><th>含义</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>formatVersion</code></td><td>必须为 <code>qemu-v1</code>。</td></tr>
+          <tr><td><code>architecture</code></td><td>QEMU 使用的 Guest 主机架构，例如 <code>amd64</code>。</td></tr>
+          <tr><td><code>qemuVersion</code></td><td>运行中 QEMU 进程报告的版本。Worker 会通过 QMP 校验该值。</td></tr>
+          <tr><td><code>machineType</code></td><td>显式带版本的 machine type，例如 <code>pc-q35-6.2</code>。</td></tr>
+          <tr><td><code>cpuModel</code></td><td>生效的 QEMU CPU model。<code>host</code> 通常要求恢复节点同构。</td></tr>
+          <tr><td><code>vcpus</code></td><td>生效的 vCPU 数量。</td></tr>
+          <tr><td><code>memoryBytes</code></td><td>生效的 Guest RAM 大小（字节）。</td></tr>
+          <tr><td><code>qemuConfigDigest</code></td><td>由工作负载生成的、对兼容性敏感的 QEMU 配置的 SHA-256 标识。</td></tr>
+          <tr><td><code>disks</code></td><td>可写 overlay 及其捕获策略。v1 仅支持 <code>capture: rootfs</code>。</td></tr>
+        </tbody>
+      </table>
+
+      <p><code>qemuConfigDigest</code> 在 v1 中是不透明的兼容性值。请从 machine、CPU、内存、firmware、磁盘、网络与设备设置的规范表示确定性计算它。排除 PID、时间戳、QMP 路径、生成的 socket 名等瞬时值。OpenSandbox 会记录该 digest，但不会据此重建 QEMU 命令行。</p>
+
+      <p>以原子方式写入 manifest，避免并发快照读到不完整的 JSON：</p>
+
+<pre><code>runtime_dir=/run/qemu
+manifest_tmp="$runtime_dir/launch.json.tmp"
+manifest="$runtime_dir/launch.json"
+
+mkdir -p "$runtime_dir"
+cat &gt;"$manifest_tmp" &lt;&lt;EOF
+{
+  "formatVersion": "qemu-v1",
+  "architecture": "amd64",
+  "qemuVersion": "$qemu_version",
+  "machineType": "$machine_type",
+  "cpuModel": "$cpu_model",
+  "vcpus": $vcpus,
+  "memoryBytes": $memory_bytes,
+  "qemuConfigDigest": "$qemu_config_digest",
+  "disks": [
+    {"id":"osdisk","overlayPath":"/vm/state.qcow2","capture":"rootfs"}
+  ]
+}
+EOF
+mv "$manifest_tmp" "$manifest"</code></pre>
+
+      <p>参考 E2E entrypoint 展示了如何用同一组变量构建 manifest 与 QEMU 参数。参见
+        <a href="https://github.com/alibaba/OpenSandbox/blob/main/kubernetes/test/e2e_qemu/testdata/entrypoint.sh">reference entrypoint</a>。</p>
+
+      <h3>暴露 QMP 并支持恢复</h3>
+
+      <p>在 QEMU 启动时创建已声明的 QMP Unix socket：</p>
+
+<pre><code>qemu_args+=(
+  -qmp "unix:/run/qemu/qmp.sock,server=on,wait=off"
+)</code></pre>
+
+      <p>QMP 控制存活的 QEMU 进程，并传输 migration stream。Launch manifest 则单独声明兼容性与磁盘捕获意图，这些信息无法仅靠 QMP 可靠恢复。</p>
+
+      <p>工作负载 entrypoint 必须检测 <code>OPENSANDBOX_RESTORE_MODE=qemu-v1</code>，并用 <code>OPENSANDBOX_VMSTATE_DIR</code> 中提供的 loader stream 启动 QEMU：</p>
+
+<pre><code>if [[ "${OPENSANDBOX_RESTORE_MODE:-}" == "qemu-v1" ]]; then
+  test -x "$OPENSANDBOX_VMSTATE_DIR/vmstate-loader"
+  qemu_args+=(
+    -incoming
+    "exec:$OPENSANDBOX_VMSTATE_DIR/vmstate-loader stream --dir $OPENSANDBOX_VMSTATE_DIR"
+  )
+fi</code></pre>
+
+      <p>OpenSandbox 注入恢复目录与 loader；完整 QEMU 命令行仍由工作负载拥有。它必须在消费 incoming stream 之前重建相同的 machine、CPU、内存、firmware、磁盘、网络与设备拓扑。</p>
+
+      <h3>将可写 overlay 保留在 rootfs 中</h3>
+
+      <p>每个声明为 <code>capture: rootfs</code> 的磁盘都必须是 QEMU 容器可写 rootfs 中的文件。它不得解析到 Kubernetes <code>volumeMount</code> 或 <code>volumeDevice</code> 之下，包括 PVC、hostPath、projected volume 或 <code>emptyDir</code>。<code>nerdctl commit</code> 不会捕获这些挂载，snapshot worker 会拒绝该配置，而不是创建不完整的快照。</p>
+
+      <p>不可变基础镜像可以来自原始镜像层，或其他可独立获取的只读来源。现有的用户 init containers 会在注入的 VMState loader 之前再次运行，因此它们必须幂等，且不得覆盖已恢复的可写 overlay。</p>
+
+      <h2 id="pause-resume">暂停与恢复流程</h2>
+
+      <ol>
+        <li>Controller 解析带注解的 QEMU 容器，并在同一节点上调度 snapshot Job。</li>
+        <li>Worker 校验每个声明为 <code>capture: rootfs</code> 的可写 overlay 都不在容器的 Kubernetes volume mount 路径之下。</li>
+        <li>Worker 使用 QMP migration 导出 VM 状态，用 zstd 压缩，并放入标准容器镜像。</li>
+        <li>QEMU 进入 post-migration 状态后，worker 冻结外层容器，提交其 root filesystem，并推送两类镜像。</li>
+        <li>Controller 原子发布 rootfs 与 VMState 的 manifest digests，然后删除源 Pod。</li>
+        <li>恢复时，loader init container 在 <code>emptyDir</code> 中还原并校验 VMState 文件。它会被追加到所有用户 init containers 之后。</li>
+        <li>重建的 QEMU 容器消费 migration stream。其他外层容器进程按 Pod 模板正常启动。</li>
+      </ol>
+
+      <p>不会使用 <code>savevm</code>。它会创建与 qcow2 存储耦合的内部快照，不是此处所用的 live Guest RAM 传输方式。</p>
+
+      <h2 id="helm">使用 Helm 做生产部署</h2>
+
+      <p>没有 QEMU 专用的 Helm 功能开关。Helm 安装的是集群级快照能力；每个 <code>BatchSandbox</code> 或 <code>Pool</code> 的 Pod 模板通过上述 annotations 自行启用。仅 rootfs 的工作负载继续使用既有行为。</p>
+
+      <h3>前置条件</h3>
+
+      <ul>
+        <li>Linux 节点向 QEMU 容器暴露 <code>/dev/kvm</code>。</li>
+        <li>镜像 Registry 必须接受 Docker schema 2 或 OCI image manifests，并且 snapshot Jobs 与 kubelet/containerd 都能访问。</li>
+        <li>恢复时，QEMU 版本、带版本的 machine type、CPU model、vCPU 数量、RAM 大小、设备配置 digest，以及可选的 node class 必须匹配。</li>
+        <li>Snapshot Job 需要主机 containerd runtime 目录、主机 PID namespace 以及 <code>SYS_PTRACE</code>。由于它控制 containerd socket，已经运行在节点级信任边界内。Pod Security 与 admission 策略必须显式允许该 Job。</li>
+        <li>VMState 可能包含来自 Guest RAM 的凭证与用户数据。请按敏感持久化存储同等标准应用访问控制、加密、保留与删除策略。</li>
+        <li>根据实测压缩载荷大小规划 Registry 容量。压缩效果取决于 Guest 内存内容，不保证一定很小。</li>
+      </ul>
+
+      <p>Controller 镜像与 image-committer 镜像都必须来自支持 <code>qemu-v1</code> 的版本。尤其不要依赖较旧 chart 对 <code>controller.snapshot.imageCommitterImage</code> 的默认值；请显式覆盖。</p>
+
+      <h3>创建 Registry 凭证</h3>
+
+      <p>Commit Job 与恢复后的 Pod 运行在沙箱命名空间中，因此引用的 Secrets 必须存在于每个使用快照与恢复的命名空间：</p>
+
+<pre><code>kubectl -n sandbox-team create secret docker-registry snapshot-registry \
+  --docker-server=registry.example.com \
+  --docker-username='&lt;username&gt;' \
+  --docker-password='&lt;password-or-token&gt;'</code></pre>
+
+      <p>当凭证具备 push、image-committer pull 与 resume pull 三项权限时，可共用一个 Secret。生产部署可在每个沙箱命名空间中使用同名、最小权限分离的 Secrets。</p>
+
+      <h3>配置并安装 chart</h3>
+
+      <p>创建 values 文件：</p>
+
+<pre><code>controller:
+  image:
+    repository: registry.example.com/opensandbox/controller
+    tag: qemu-v1
+  snapshot:
+    imageCommitterImage: registry.example.com/opensandbox/image-committer:qemu-v1
+    containerdSocketPath: /var/run/containerd/containerd.sock
+    commitJobTimeout: 15m
+    registry: registry.example.com/opensandbox-snapshots
+    registryInsecure: false
+    snapshotPushSecret: snapshot-registry
+    imageCommitterPullSecret: snapshot-registry
+    resumePullSecret: snapshot-registry</code></pre>
+
+      <p>安装或升级 controller。在全新集群上，请先安装 base chart——controller chart 不再附带 CRD：</p>
+
+<pre><code>helm upgrade --install base ./manifests/charts/base
+
+helm upgrade --install opensandbox-controller \
+  ./manifests/charts/controller \
+  --namespace opensandbox-system \
+  --create-namespace \
+  --values qemu-snapshot-values.yaml</code></pre>
+
+      <p>将 CRD 同步进 base chart（<code>make -C manifests helm-gen-crds</code>），并升级 <code>base</code>，使更新后的 <code>SandboxSnapshot</code> CRD 生效。在创建工作负载前验证已部署能力：</p>
+
+<pre><code>kubectl -n opensandbox-system rollout status \
+  deployment/opensandbox-controller-manager
+kubectl -n opensandbox-system get deployment,pod
+kubectl get crd sandboxsnapshots.sandbox.opensandbox.io
+kubectl get crd sandboxsnapshots.sandbox.opensandbox.io \
+  -o jsonpath='{.spec.versions[0].schema.openAPIV3Schema.properties.status.properties.virtualMachine.type}{"\n"}'</code></pre>
+
+      <p>确认集群 admission 允许受节点信任的 snapshot Job。QEMU 模式需要主机 PID namespace、<code>SYS_PTRACE</code> 以及主机 containerd runtime 目录。QEMU 工作负载本身需要 <code>/dev/kvm</code>，除非平台提供更窄的设备权限，否则通常以特权方式运行。</p>
+
+      <p>对于异构集群，给兼容的恢复节点打标签，并在工作负载上声明匹配的 class：</p>
+
+<pre><code>kubectl label node &lt;node&gt; \
+  sandbox.opensandbox.io/qemu-node-class=shenlong-v1</code></pre>
+
+<pre><code>metadata:
+  annotations:
+    sandbox.opensandbox.io/qemu-required-node-class: shenlong-v1</code></pre>
+
+      <p>快照镜像名会生成在已配置的 Registry 前缀之下。QEMU 沙箱会生成普通容器 rootfs 镜像（如 <code>&lt;prefix&gt;/&lt;sandbox&gt;-&lt;container&gt;:&lt;tag&gt;</code>）以及 VMState 镜像（如 <code>&lt;prefix&gt;/&lt;sandbox&gt;-vmstate:&lt;tag&gt;</code>）。恢复会解析并使用它们不可变的 manifest digests。</p>
+
+      <h2 id="validation">验证</h2>
+
+      <p>专用 E2E 会从 <code>Pool</code> 分配一个预热的 QEMU-in-runc Pod，分别向匿名 mmap、原始 Guest 磁盘与外层 rootfs 写入独立值，快照两类镜像，并恢复为独立 Pod。它会验证 Pool 补位与脱离、不可变的 rootfs 与 VMState 镜像 digests、loader 完成、快照清理、全部三个值、Guest boot ID，以及 live counter：</p>
+
+<pre><code>cd kubernetes
+make test-e2e-qemu</code></pre>
+
+      <p>测试需要 Linux amd64、Docker、Kind、kubectl 与 <code>/dev/kvm</code>。默认会在 Kind 集群中部署隔离的 <code>registry:2</code> Pod。设置 <code>QEMU_E2E_SNAPSHOT_REGISTRY</code> 与 <code>QEMU_E2E_DOCKER_CONFIG</code> 可对外部认证 Registry 验证同一流程；两个仓库为 <code>&lt;prefix&gt;/qemu-rootfs</code> 与 <code>&lt;prefix&gt;/qemu-vmstate</code>。设置 <code>KEEP_QEMU_E2E_CLUSTER=true</code> 可保留专用 Kind 集群以便诊断。全部覆盖项见
+        <a href="https://github.com/alibaba/OpenSandbox/tree/main/kubernetes/test/e2e_qemu">E2E README</a>。</p>
+
+      <h3>可复用的 Kind 验证环境</h3>
+
+      <p>E2E harness 可以构建镜像、创建启用 KVM 的专用 Kind 集群、部署 controller 与 Registry、运行参考 Pool 流程，并留下环境供人工检查：</p>
+
+<pre><code>cd kubernetes
+KEEP_QEMU_E2E_CLUSTER=true make test-e2e-qemu</code></pre>
+
+      <p>得到的 context 为 <code>kind-opensandbox-qemu-vmstate-e2e</code>。Controller 运行在 <code>opensandbox-system</code>，集群内 <code>registry:2</code> Pod 与自动化测试对象运行在 <code>qemu-vmstate-e2e</code>：</p>
+
+<pre><code>kubectl --context kind-opensandbox-qemu-vmstate-e2e \
+  -n opensandbox-system get deploy,pod
+kubectl --context kind-opensandbox-qemu-vmstate-e2e \
+  -n qemu-vmstate-e2e get pod,service,pool,batchsandbox</code></pre>
+
+      <p>若要改用外部认证 Registry，请提供其仓库前缀与本地 Docker <code>config.json</code>；harness 会创建临时 Kubernetes pull/push Secret，且不会打印其内容：</p>
+
+<pre><code>QEMU_E2E_SNAPSHOT_REGISTRY=registry.example.com/team \
+QEMU_E2E_DOCKER_CONFIG=/path/to/config.json \
+KEEP_QEMU_E2E_CLUSTER=true \
+make test-e2e-qemu</code></pre>
+
+      <p>下面的命令使用独立的 <code>qemu-manual</code> 命名空间，因此不必先删除保留下来的 E2E 对象。</p>
+
+      <h3>在已准备好的 Kind 集群中手工验证</h3>
+
+      <p>该流程有意把生命周期操作留给操作者。它假定 controller、快照 Registry、image-committer 镜像与演示用 QEMU 镜像已安装在带 <code>/dev/kvm</code> 的 Kind 集群中。从仓库根目录选择该集群，并只创建独立的 <code>BatchSandbox</code>：</p>
+
+<pre><code>export OSB_QEMU_CONTEXT=kind-opensandbox-qemu-vmstate-e2e
+export OSB_QEMU_NAMESPACE=qemu-manual
+export OSB_QEMU_SANDBOX=qemu-standalone
+export OSB_QEMU_POD=qemu-standalone-0
+
+test -c /dev/kvm
+kubectl --context "$OSB_QEMU_CONTEXT" get nodes
+kubectl --context "$OSB_QEMU_CONTEXT" -n opensandbox-system \
+  rollout status deployment/opensandbox-controller-manager
+kubectl --context "$OSB_QEMU_CONTEXT" apply \
+  -f kubernetes/config/samples/alibaba/qemu-vmstate/standalone.yaml
+kubectl --context "$OSB_QEMU_CONTEXT" -n "$OSB_QEMU_NAMESPACE" \
+  wait --for=condition=Ready pod/"$OSB_QEMU_POD" --timeout=180s</code></pre>
+
+      <p>暂停前，先核对 snapshot worker 将使用的确切约定：</p>
+
+<pre><code>kubectl --context "$OSB_QEMU_CONTEXT" -n "$OSB_QEMU_NAMESPACE" \
+  get pod "$OSB_QEMU_POD" \
+  -o jsonpath='{.metadata.annotations}{"\n"}'
+kubectl --context "$OSB_QEMU_CONTEXT" -n "$OSB_QEMU_NAMESPACE" \
+  exec "$OSB_QEMU_POD" -c qemu -- \
+  test -S /run/qemu-e2e/qmp.sock
+kubectl --context "$OSB_QEMU_CONTEXT" -n "$OSB_QEMU_NAMESPACE" \
+  exec "$OSB_QEMU_POD" -c qemu -- \
+  cat /run/qemu-e2e/launch.json</code></pre>
+
+      <p>如果注解容器、socket 路径、manifest 路径或生效的 QEMU 设置不一致，请不要继续。</p>
+
+      <p>演示 Guest 在同一 PID 1 进程中运行 HTTP 服务与可变内存映射。QEMU 用户态网络会把外层容器 loopback 端口 <code>18080</code> 转发到 Guest 端口 <code>8080</code>；该服务不会暴露在 Pod IP 上。</p>
+
+      <table>
+        <thead>
+          <tr><th>Endpoint</th><th>用途</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>GET /healthz</code></td><td>验证恢复后的 Guest 进程正在提供请求</td></tr>
+          <tr><td><code>PUT /value</code></td><td>在进程内存映射中存储最多 512 字节的值</td></tr>
+          <tr><td><code>GET /value</code></td><td>读取当前内存映射值</td></tr>
+          <tr><td><code>GET /status</code></td><td>读取 PID、Guest boot ID、基于 mmap 的 live counter，以及 value</td></tr>
+          <tr><td><code>PUT /disk</code></td><td>在原始可写 Guest 磁盘中存储标记</td></tr>
+          <tr><td><code>GET /disk</code></td><td>读取原始 Guest 磁盘标记</td></tr>
+        </tbody>
+      </table>
+
+      <p>定义阶段等待函数，并在 Guest 内存、Guest 磁盘与外层容器 rootfs 中写入三个独立标记：</p>
+
+<pre><code>wait_for_sandbox_phase() {
+  local wanted=$1
+  local phase=
+  for _ in $(seq 1 180); do
+    phase=$(kubectl --context "$OSB_QEMU_CONTEXT" \
+      -n "$OSB_QEMU_NAMESPACE" get batchsandbox "$OSB_QEMU_SANDBOX" \
+      -o jsonpath='{.status.phase}' 2&gt;/dev/null || true)
+    if [[ "$phase" == "$wanted" ]]; then
+      return 0
+    fi
+    sleep 2
+  done
+  echo "timed out waiting for phase=$wanted; last phase=$phase" &gt;&amp;2
+  return 1
+}
+
+export OSB_MEMORY_TOKEN="MANUAL-MMAP-$(date -u +%Y%m%dT%H%M%SZ)"
+export OSB_DISK_TOKEN="MANUAL-DISK-$(date -u +%Y%m%dT%H%M%SZ)"
+export OSB_ROOTFS_TOKEN="MANUAL-ROOTFS-$(date -u +%Y%m%dT%H%M%SZ)"
+
+kubectl --context "$OSB_QEMU_CONTEXT" -n "$OSB_QEMU_NAMESPACE" \
+  exec "$OSB_QEMU_POD" -c qemu -- \
+  curl --fail --silent --show-error --request PUT \
+  --data-binary "$OSB_MEMORY_TOKEN" http://127.0.0.1:18080/value
+kubectl --context "$OSB_QEMU_CONTEXT" -n "$OSB_QEMU_NAMESPACE" \
+  exec "$OSB_QEMU_POD" -c qemu -- \
+  curl --fail --silent --show-error --request PUT \
+  --data-binary "$OSB_DISK_TOKEN" http://127.0.0.1:18080/disk
+kubectl --context "$OSB_QEMU_CONTEXT" -n "$OSB_QEMU_NAMESPACE" \
+  exec "$OSB_QEMU_POD" -c qemu -- sh -c \
+  'mkdir -p /var/lib/opensandbox &amp;&amp; printf "%s" "$1" &gt; /var/lib/opensandbox/rootfs-marker' \
+  sh "$OSB_ROOTFS_TOKEN"
+
+OSB_BEFORE=$(kubectl --context "$OSB_QEMU_CONTEXT" -n "$OSB_QEMU_NAMESPACE" \
+  exec "$OSB_QEMU_POD" -c qemu -- \
+  curl --fail --silent --show-error http://127.0.0.1:18080/status)
+OSB_SOURCE_UID=$(kubectl --context "$OSB_QEMU_CONTEXT" -n "$OSB_QEMU_NAMESPACE" \
+  get pod "$OSB_QEMU_POD" -o jsonpath='{.metadata.uid}')
+printf 'before: %s\nsource uid: %s\n' "$OSB_BEFORE" "$OSB_SOURCE_UID"</code></pre>
+
+      <p>在另一个终端中监视暂停与恢复相关的资源：</p>
+
+<pre><code>watch -n 1 kubectl --context "$OSB_QEMU_CONTEXT" \
+  -n "$OSB_QEMU_NAMESPACE" get batchsandbox,sandboxsnapshot,pod,job</code></pre>
+
+      <p>初始 manifest 有意省略 <code>spec.pause</code>：在全新对象上把它设为 <code>false</code> 会被解释为显式恢复请求。通过添加 <code>spec.pause: true</code> 暂停沙箱，然后检查两个不可变镜像制品：</p>
+
+<pre><code>kubectl --context "$OSB_QEMU_CONTEXT" -n "$OSB_QEMU_NAMESPACE" \
+  edit batchsandbox "$OSB_QEMU_SANDBOX"
+wait_for_sandbox_phase Paused
+
+export OSB_SNAPSHOT_NAME="$OSB_QEMU_SANDBOX-pause"
+kubectl --context "$OSB_QEMU_CONTEXT" -n "$OSB_QEMU_NAMESPACE" \
+  get sandboxsnapshot "$OSB_SNAPSHOT_NAME" -o yaml
+kubectl --context "$OSB_QEMU_CONTEXT" -n "$OSB_QEMU_NAMESPACE" \
+  wait --for=delete pod/"$OSB_QEMU_POD" --timeout=120s</code></pre>
+
+      <p>快照必须报告 <code>status.format: qemu-v1</code>、<code>status.containers</code> 下的 rootfs 镜像 digest，以及 <code>status.virtualMachine</code> 下不同的 VMState 镜像 digest 与非零压缩大小。</p>
+
+      <p>将 <code>spec.pause</code> 编辑为 <code>false</code> 以恢复，然后验证进程级连续性与两层文件系统：</p>
+
+<pre><code>kubectl --context "$OSB_QEMU_CONTEXT" -n "$OSB_QEMU_NAMESPACE" \
+  edit batchsandbox "$OSB_QEMU_SANDBOX"
+wait_for_sandbox_phase Succeed
+kubectl --context "$OSB_QEMU_CONTEXT" -n "$OSB_QEMU_NAMESPACE" \
+  wait --for=condition=Ready pod/"$OSB_QEMU_POD" --timeout=180s
+
+OSB_AFTER=$(kubectl --context "$OSB_QEMU_CONTEXT" -n "$OSB_QEMU_NAMESPACE" \
+  exec "$OSB_QEMU_POD" -c qemu -- \
+  curl --fail --silent --show-error http://127.0.0.1:18080/status)
+OSB_AFTER_DISK=$(kubectl --context "$OSB_QEMU_CONTEXT" -n "$OSB_QEMU_NAMESPACE" \
+  exec "$OSB_QEMU_POD" -c qemu -- \
+  curl --fail --silent --show-error http://127.0.0.1:18080/disk)
+OSB_AFTER_ROOTFS=$(kubectl --context "$OSB_QEMU_CONTEXT" -n "$OSB_QEMU_NAMESPACE" \
+  exec "$OSB_QEMU_POD" -c qemu -- cat /var/lib/opensandbox/rootfs-marker)
+OSB_RESTORED_UID=$(kubectl --context "$OSB_QEMU_CONTEXT" -n "$OSB_QEMU_NAMESPACE" \
+  get pod "$OSB_QEMU_POD" -o jsonpath='{.metadata.uid}')
+
+OSB_BEFORE_BOOT_ID=$(printf '%s\n' "$OSB_BEFORE" | sed -n 's/.*"boot_id":"\([^"]*\)".*/\1/p')
+OSB_AFTER_BOOT_ID=$(printf '%s\n' "$OSB_AFTER" | sed -n 's/.*"boot_id":"\([^"]*\)".*/\1/p')
+OSB_BEFORE_COUNTER=$(printf '%s\n' "$OSB_BEFORE" | sed -n 's/.*"counter":\([0-9]*\).*/\1/p')
+OSB_AFTER_COUNTER=$(printf '%s\n' "$OSB_AFTER" | sed -n 's/.*"counter":\([0-9]*\).*/\1/p')
+
+[[ "$OSB_SOURCE_UID" != "$OSB_RESTORED_UID" ]]
+[[ "$OSB_BEFORE_BOOT_ID" == "$OSB_AFTER_BOOT_ID" ]]
+((OSB_AFTER_COUNTER &gt; OSB_BEFORE_COUNTER))
+[[ "$OSB_AFTER" == *"\"value\":\"$OSB_MEMORY_TOKEN\""* ]]
+[[ "$OSB_AFTER_DISK" == *"\"value\":\"$OSB_DISK_TOKEN\""* ]]
+[[ "$OSB_AFTER_ROOTFS" == "$OSB_ROOTFS_TOKEN" ]]
+
+printf 'after: %s\ndisk: %s\nrootfs: %s\nrestored uid: %s\n' \
+  "$OSB_AFTER" "$OSB_AFTER_DISK" "$OSB_AFTER_ROOTFS" "$OSB_RESTORED_UID"
+kubectl --context "$OSB_QEMU_CONTEXT" -n "$OSB_QEMU_NAMESPACE" \
+  get pod "$OSB_QEMU_POD" -o jsonpath='{range .status.initContainerStatuses[*]}{.name}{"="}{.state.terminated.reason}{"\n"}{end}'</code></pre>
+
+      <p>所有断言都必须返回零。Pod UID 必须变化，Guest boot ID 必须保持不变，live counter 必须增加，三个 token 都必须匹配，且 VMState loader init container 必须报告 <code>Completed</code>。成功恢复后，内部 <code>SandboxSnapshot</code> 会被删除。结束时只删除测试对象；Kind 基础设施仍然可用：</p>
+
+<pre><code>kubectl --context "$OSB_QEMU_CONTEXT" delete \
+  -f kubernetes/config/samples/alibaba/qemu-vmstate/standalone.yaml</code></pre>
+
+      <h3>使用 Pool 进行手工验证</h3>
+
+      <p>先创建 Pool 并等待其预热 QEMU Pod。然后创建分配该 Pod 的 <code>BatchSandbox</code>：</p>
+
+<pre><code>kubectl --context "$OSB_QEMU_CONTEXT" apply \
+  -f kubernetes/config/samples/alibaba/qemu-vmstate/pool.yaml
+kubectl --context "$OSB_QEMU_CONTEXT" -n "$OSB_QEMU_NAMESPACE" \
+  get pool qemu-pool -w</code></pre>
+
+      <p>在 Pool 报告 ready capacity 后停止 watch，并运行：</p>
+
+<pre><code>kubectl --context "$OSB_QEMU_CONTEXT" apply \
+  -f kubernetes/config/samples/alibaba/qemu-vmstate/pooled-sandbox.yaml
+kubectl --context "$OSB_QEMU_CONTEXT" -n "$OSB_QEMU_NAMESPACE" \
+  get batchsandbox qemu-pooled -w</code></pre>
+
+      <p>从 allocation annotation 读取已分配的 Pod 名，并写入与独立场景相同的三个标记：</p>
+
+<pre><code>export OSB_POOLED_POD=$(kubectl --context "$OSB_QEMU_CONTEXT" \
+  -n "$OSB_QEMU_NAMESPACE" get batchsandbox qemu-pooled \
+  -o jsonpath='{.metadata.annotations.sandbox\.opensandbox\.io/alloc-status}' \
+  | jq -r '.pods[0]')
+
+export OSB_POOL_MEMORY_TOKEN="POOL-MMAP-$(date -u +%Y%m%dT%H%M%SZ)"
+export OSB_POOL_DISK_TOKEN="POOL-DISK-$(date -u +%Y%m%dT%H%M%SZ)"
+export OSB_POOL_ROOTFS_TOKEN="POOL-ROOTFS-$(date -u +%Y%m%dT%H%M%SZ)"
+
+kubectl --context "$OSB_QEMU_CONTEXT" -n "$OSB_QEMU_NAMESPACE" \
+  exec "$OSB_POOLED_POD" -c qemu -- \
+  curl --fail --silent --show-error --request PUT \
+  --data-binary "$OSB_POOL_MEMORY_TOKEN" http://127.0.0.1:18080/value
+kubectl --context "$OSB_QEMU_CONTEXT" -n "$OSB_QEMU_NAMESPACE" \
+  exec "$OSB_POOLED_POD" -c qemu -- \
+  curl --fail --silent --show-error --request PUT \
+  --data-binary "$OSB_POOL_DISK_TOKEN" http://127.0.0.1:18080/disk
+kubectl --context "$OSB_QEMU_CONTEXT" -n "$OSB_QEMU_NAMESPACE" \
+  exec "$OSB_POOLED_POD" -c qemu -- sh -c \
+  'mkdir -p /var/lib/opensandbox &amp;&amp; printf "%s" "$1" &gt; /var/lib/opensandbox/rootfs-marker' \
+  sh "$OSB_POOL_ROOTFS_TOKEN"</code></pre>
+
+      <p>运行 <code>kubectl edit batchsandbox qemu-pooled -n qemu-manual</code> 并添加 <code>spec.pause: true</code>。暂停成功后，验证 Pool 特有的交接：</p>
+
+<pre><code>kubectl --context "$OSB_QEMU_CONTEXT" -n "$OSB_QEMU_NAMESPACE" \
+  get batchsandbox qemu-pooled \
+  -o jsonpath='phase={.status.phase}{" poolRef="}{.spec.poolRef}{" templateContainers="}{.spec.template.spec.containers[*].name}{"\n"}'
+kubectl --context "$OSB_QEMU_CONTEXT" -n "$OSB_QEMU_NAMESPACE" \
+  get sandboxsnapshot qemu-pooled-pause -o yaml</code></pre>
+
+      <p>阶段必须为 <code>Paused</code>。Controller 会将已分配 Pod 的模板物化进 <code>BatchSandbox</code>，并清除 <code>spec.poolRef</code>；这种脱离是有意的，因此恢复会创建独立 Pod，而不是退回 Pool。将 <code>spec.pause</code> 改回 <code>false</code>，等待 <code>qemu-pooled-0</code> 变为 Ready，然后对其调用 <code>GET /status</code>、<code>GET /disk</code> 以及 rootfs 标记检查。</p>
+
+      <p>清理 Pool 示例，但不删除 Kind 集群：</p>
+
+<pre><code>kubectl --context "$OSB_QEMU_CONTEXT" delete \
+  -f kubernetes/config/samples/alibaba/qemu-vmstate/pooled-sandbox.yaml
+kubectl --context "$OSB_QEMU_CONTEXT" delete \
+  -f kubernetes/config/samples/alibaba/qemu-vmstate/pool.yaml</code></pre>
+
+      <h2 id="troubleshooting">故障排查</h2>
+
+      <table>
+        <thead>
+          <tr><th>现象</th><th>检查项</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>InvalidCheckpointContract</code></td><td>确认四个必需 annotations 都在实际 Pod 模板上，并指向存在的容器。路径必须干净且为绝对路径。</td></tr>
+          <tr><td>Launch manifest 复制或解码失败</td><td>进入注解容器，读取确切路径，确认 entrypoint 在 readiness 成功前写入完整 JSON。</td></tr>
+          <tr><td>QMP probe 失败</td><td>确认声明路径是 Unix socket，且 QEMU 使用 <code>server=on,wait=off</code>。检查是否有 supervisor 删除或替换了 socket。</td></tr>
+          <tr><td>QEMU 版本不匹配</td><td>比较 manifest 中的 <code>qemuVersion</code> 与运行中二进制。在容器启动时生成 manifest，而不是把过期版本烘焙进镜像。</td></tr>
+          <tr><td>可写磁盘被拒绝</td><td>检查 QEMU 容器上的每个 <code>volumeMount</code> 与 <code>volumeDevice</code>。<code>capture: rootfs</code> overlay 不能位于任何挂载路径之下。</td></tr>
+          <tr><td>Snapshot Job 被 admission 拒绝</td><td>允许 image-committer Job 身份在具备快照能力的节点上使用主机 PID、<code>SYS_PTRACE</code> 与主机 containerd runtime 目录。</td></tr>
+          <tr><td>Snapshot Job <code>ImagePullBackOff</code></td><td>确认 <code>imageCommitterPullSecret</code> 存在于沙箱命名空间，并能拉取已配置的 image-committer 镜像。</td></tr>
+          <tr><td>恢复后的 Pod <code>ImagePullBackOff</code></td><td>确认 <code>resumePullSecret</code> 存在于沙箱命名空间，并能拉取 rootfs 与 VMState 镜像仓库。</td></tr>
+          <tr><td>QEMU 在消费 <code>-incoming</code> 时退出</td><td>将 QEMU 版本、machine type、CPU model、vCPU 数量、内存、firmware、磁盘、网络与设备拓扑与捕获的兼容性数据对比。</td></tr>
+          <tr><td>恢复后 Pod 无法调度</td><td>检查 <code>/dev/kvm</code>、节点亲和性，以及 <code>qemu-required-node-class</code> 与节点 <code>qemu-node-class</code> 标签是否匹配。</td></tr>
+        </tbody>
+      </table>
+
+      <p>从快照状态与 commit Job 日志开始诊断：</p>
+
+<pre><code>kubectl -n &lt;namespace&gt; get sandboxsnapshot &lt;name&gt; -o yaml
+kubectl -n &lt;namespace&gt; get job,pod \
+  -l sandbox.opensandbox.io/sandbox-snapshot-name=&lt;name&gt;
+kubectl -n &lt;namespace&gt; logs job/&lt;commit-job-name&gt; --all-containers</code></pre>
+
+      <div class="footer-nav">
+        <a href="pause-resume.html">← 暂停与恢复</a>
+        <a href="egress-sse-truncation.html">Egress SSE 截断 →</a>
+      </div>
+    </main>
+  </div>
+</body>
+</html>

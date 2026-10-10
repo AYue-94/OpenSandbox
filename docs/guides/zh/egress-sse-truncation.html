@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Egress Mitmproxy SSE 截断 · OpenSandbox 指南（中文）</title>
+  <meta name="description" content="为何在 HTTP/1.1 上游以 TCP RST 关闭连接时，大型 SSE 响应体会被截断；如何确认，以及如何在网关侧修复。" />
+  <link rel="stylesheet" href="guides-zh.css" />
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <a class="brand" href="index.html">OpenSandbox</a>
+      <div class="brand-sub">功能指南 · 中文版</div>
+      <h2>目录</h2>
+      <nav>
+      <a href="index.html">总览</a>
+      <a href="credential-vault.html">凭证保管库</a>
+      <a href="secure-access.html">安全访问</a>
+      <a href="secure-container.html">安全容器运行时</a>
+      <a href="multi-tenancy.html">多租户</a>
+      <a href="isolation-sessions.html">隔离会话</a>
+      <a href="pause-resume.html">暂停与恢复</a>
+      <a href="qemu-vmstate-snapshots.html">QEMU VMState 快照</a>
+      <a href="egress-sse-truncation.html" class="active">Egress SSE 截断</a>
+      <a href="lifecycle-hooks.html">生命周期钩子</a>
+      <a href="windows-sandbox.html">Windows 沙箱</a>
+      <a href="client-pool.html">客户端 Pool</a>
+      <a href="component-telemetry.html">组件遥测</a>
+      </nav>
+      <p class="note" style="margin-top:1.5rem">由英文 docs/guides/*.md 翻译的静态 HTML，便于本地阅读。</p>
+    </aside>
+    <main class="content">
+      <header class="page-head">
+        <h1>Egress Mitmproxy：大型 SSE 分块尾部截断</h1>
+        <p class="desc">为何在 HTTP/1.1 上游以 TCP RST 关闭连接时，大型 SSE 响应体会被截断；如何确认，以及如何在网关侧修复。</p>
+      </header>
+
+      <h2>现象</h2>
+      <p>沙箱经 egress sidecar 调用 LLM API 时，有时会收到<strong>被截断的 SSE 流</strong>：大于约 1 MB 的 <code>data:</code> 事件会在接近末尾处被切断，SDK 报告 JSON 畸形或连接中断。丢失的数据量不等（从几字节到数百 KB）。</p>
+
+      <h2>根因</h2>
+      <p>对整条数据路径的字节级仪器化表明，这是<strong>标准的 TCP RST 语义</strong>，而非 mitmproxy 或 OpenSandbox 的缺陷：</p>
+      <ol>
+        <li>上游在接收缓冲区中仍有未读数据时关闭连接（例如网关流式返回响应却未消费客户端请求体）。内核会发送 <strong>TCP RST</strong>，而不是干净的 FIN。</li>
+        <li>根据 <a href="https://www.rfc-editor.org/rfc/rfc793">RFC 793</a>，RST 会丢弃接收端内核接收缓冲区中尚未读取的数据——响应尾部未读部分在任何应用代码看到之前就已丢失。</li>
+        <li>随后 mitmproxy 的 h11 解析器硬错误（<code>incomplete chunked read</code>），该 flow 被终止，客户端连接被关闭。</li>
+      </ol>
+
+      <p>已通过受控的 A/B/C 实验确认（同一服务端代码、负载、代理与客户端；仅关闭行为不同）：</p>
+      <table>
+        <thead>
+          <tr>
+            <th>关闭行为</th>
+            <th>mitmproxy TCP 特征</th>
+            <th>客户端结果</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>A. 关闭时仍有未读请求数据 → 内核 RST</td>
+            <td><code>ConnectionResetError</code></td>
+            <td>截断，5/5</td>
+          </tr>
+          <tr>
+            <td>B. 请求已消费后关闭 → 干净 FIN</td>
+            <td>干净 EOF</td>
+            <td>完整，5/5</td>
+          </tr>
+          <tr>
+            <td>C. 请求已消费 + <code>SO_LINGER=0</code> 强制 RST（接收缓冲区为空）</td>
+            <td><code>ConnectionResetError</code></td>
+            <td>截断，4/5</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <p>单元 C 是铁证：<strong>仅 RST 即可复现截断，即使没有未读数据；FIN 则从不如此</strong>。直接慢读客户端在面对服务端 A 时会丢失整个响应体，面对服务端 B 则无丢失，因此损失量纯粹取决于 RST 到达时尾部还有多少未读数据。HTTP/2 上游与 keep-alive 连接不受影响。</p>
+
+      <h2>复现</h2>
+      <p><a href="https://github.com/opensandbox-group/OpenSandbox/blob/main/components/egress/tests/mitm-sse-truncation/run.sh"><code>components/egress/tests/mitm-sse-truncation/</code></a> 中的脚本会驱动本地 <code>mitmdump</code>（选项与 egress 透明模式相同），对接一个以 RST 关闭的合成 SSE 上游：</p>
+      <pre><code>cd components/egress
+./tests/mitm-sse-truncation/run.sh            # reproduce the truncation (TLS, 4 MiB, RST close)
+./tests/mitm-sse-truncation/run.sh --plain     # controls that must pass
+./tests/mitm-sse-truncation/run.sh --delay-close 1
+./tests/mitm-sse-truncation/run.sh --read-request
+./tests/mitm-sse-truncation/run.sh --probe --keep-workdir   # show the error hook in the mitmdump log</code></pre>
+
+      <p>需要 <code>python3</code>、<code>openssl</code>、<code>mitmdump</code>（若不在 <code>PATH</code> 上，可传 <code>--mitmdump PATH</code>）。选项：<code>--size</code>、<code>--iterations</code>、<code>--delay-close</code>、<code>--plain</code>、<code>--read-request</code>、<code>--probe</code>、<code>--mitmdump</code>、<code>--port</code>、<code>--upstream-port</code>、<code>--workdir</code>、<code>--keep-workdir</code>。</p>
+
+      <h2>修复（网关侧）</h2>
+      <p>mitmproxy 或 OpenSandbox 中没有可写的代码修复——这些字节已从内核中消失。修复应落在上游服务器。</p>
+
+      <p><strong>先确认是否为 RST</strong>（在网关上或前方复现时运行）：</p>
+      <pre><code>tcpdump -ni any 'tcp port 443 and tcp[tcpflags] &amp; (tcp-rst) != 0'   # RST right after the last response byte, no FIN
+netstat -s | grep -i reset
+# from a client: "Recv failure: Connection reset by peer" / curl: (56) instead of a clean EOF</code></pre>
+
+      <p><strong>然后修复关闭行为</strong>——规则是：关闭前消费请求；对 SSE，最好根本不要关闭：</p>
+      <ul>
+        <li><strong>nginx</strong>：保持 <code>lingering_close on</code>（默认），配合 <code>lingering_time 30s</code> / <code>lingering_timeout 5s</code>；尤其在设置了 <code>proxy_request_buffering off</code> 时需检查。</li>
+        <li><strong>FastAPI / uvicorn / Starlette</strong>：在流式返回前读取请求体（<code>await request.body()</code>），否则「流式响应后关闭」可能使请求体未读 → RST。</li>
+        <li><strong>Go net/http</strong>：显式排空请求体（<code>io.Copy(io.Discard, r.Body)</code>）；Go 不会替你排空。切勿在流式响应上使用 <code>SO_LINGER</code> 0（<code>SetLinger(0)</code>）。</li>
+        <li><strong>通用</strong>：优先 keep-alive（以 <code>0\r\n\r\n</code> 结束分块响应体）；若必须关闭，先排空接收缓冲区；HTTP/2 连接可避免整类失败。</li>
+      </ul>
+
+      <p>若无法修改网关：让沙箱经 HTTP/2 访问该网关，或在其前方加一层会消费请求体并以 keep-alive 转发的代理。</p>
+
+      <h2>状态</h2>
+      <ul>
+        <li>mitmproxy 上游：<a href="https://github.com/mitmproxy/mitmproxy/issues/8364">mitmproxy/mitmproxy#8364</a> — 已关闭为 not-a-bug（TCP RST 语义）。</li>
+        <li>OpenSandbox 跟踪：<a href="https://github.com/opensandbox-group/OpenSandbox/issues/1461">opensandbox-group/OpenSandbox#1461</a> — 等待现场确认。</li>
+      </ul>
+
+      <p>曾考虑并测量过增大 egress 侧读缓冲区：它能在突发速率下缩小丢失窗口，但不会改变用户可见结果（尾部 SSE 事件无论如何都会丢失），因此未合入补丁。</p>
+    </main>
+  </div>
+</body>
+</html>
